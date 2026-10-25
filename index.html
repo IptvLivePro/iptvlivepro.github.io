@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>StreamPulse — Live TV Guide & Universal IPTV Player</title>
+    <meta name="description" content="Modern JioTV Guide light-theme universal HTTP/HTTPS IPTV player with full IPTV-Org channel directory, real 1080p–144p quality control, and watermark-free recording." />
+    <meta property="og:title" content="StreamPulse — Live TV Guide & Universal IPTV Player" />
+    <meta property="og:description" content="Modern JioTV Guide light-theme universal HTTP/HTTPS IPTV player with full IPTV-Org channel directory, real 1080p–144p quality control, and watermark-free recording." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  </head>
+  <body class="bg-[#F4F6F9] text-slate-900 antialiased selection:bg-rose-500/15 selection:text-rose-700 overflow-x-hidden">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+    <script>
+      (function () {
+        window.addEventListener('DOMContentLoaded', function () {
+          setTimeout(function () {
+            var root = document.getElementById('root');
+            if (root && root.childNodes.length === 0) {
+              var css = document.createElement('link');
+              css.rel = 'stylesheet';
+              css.href = './public/app-bundle.css';
+              document.head.appendChild(css);
+
+              var s = document.createElement('script');
+              s.type = 'module';
+              s.src = './public/app-bundle.js';
+              document.body.appendChild(s);
+            }
+          }, 350);
+        });
+      })();
+    </script>
+  </body>
+</html>
