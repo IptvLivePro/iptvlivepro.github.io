@@ -732,3 +732,99 @@ export async function queryOfficialCatalogWithFallback(
     total: filtered.length,
   };
 }
+
+export function normalizeStreamUrlForMatch(raw: string): string {
+  const trimmed = (raw || '').trim();
+  if (!trimmed) return '';
+  try {
+    const u = new URL(trimmed);
+    const cleanPath = u.pathname.replace(/\/+$/, '');
+    return `${u.protocol.toLowerCase()}//${u.host.toLowerCase()}${cleanPath}${u.search}`;
+  } catch {
+    return trimmed.replace(/\/+$/, '').toLowerCase();
+  }
+}
+
+export function normalizeStreamUrlNoQuery(raw: string): string {
+  const trimmed = (raw || '').trim();
+  if (!trimmed) return '';
+  try {
+    const u = new URL(trimmed);
+    const cleanPath = u.pathname.replace(/\/+$/, '');
+    return `${u.protocol.toLowerCase()}//${u.host.toLowerCase()}${cleanPath}`;
+  } catch {
+    return trimmed.split('?')[0].replace(/\/+$/, '').toLowerCase();
+  }
+}
+
+export function matchChannelInListByStreamUrl(
+  rawUrl: string,
+  list: UnifiedChannel[]
+): { channel: UnifiedChannel; streamIndex: number } | null {
+  const normExact = normalizeStreamUrlForMatch(rawUrl);
+  const normBase = normalizeStreamUrlNoQuery(rawUrl);
+  if (!normExact) return null;
+
+  // Pass 1: Exact normalized URL match (including query string)
+  for (const ch of list) {
+    if (!ch || !Array.isArray(ch.streams)) continue;
+    for (let i = 0; i < ch.streams.length; i++) {
+      const sUrl = ch.streams[i]?.url || '';
+      if (normalizeStreamUrlForMatch(sUrl) === normExact) {
+        return { channel: ch, streamIndex: i };
+      }
+    }
+  }
+
+  // Pass 2: Base URL match (ignoring transient tokens/query params if path is specific)
+  if (normBase && normBase.split('/').length >= 4) {
+    for (const ch of list) {
+      if (!ch || !Array.isArray(ch.streams)) continue;
+      for (let i = 0; i < ch.streams.length; i++) {
+        const sUrl = ch.streams[i]?.url || '';
+        if (normalizeStreamUrlNoQuery(sUrl) === normBase) {
+          return { channel: ch, streamIndex: i };
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+export async function findChannelByStreamUrl(
+  rawUrl: string,
+  localChannels: UnifiedChannel[] = []
+): Promise<{ channel: UnifiedChannel; streamIndex: number } | null> {
+  const localMatch = matchChannelInListByStreamUrl(rawUrl, localChannels);
+  if (localMatch) return localMatch;
+
+  try {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 4500);
+    const res = await fetch(
+      `/api/iptv-org/lookup-stream?url=${encodeURIComponent(rawUrl.trim())}`,
+      { signal: controller.signal }
+    );
+    clearTimeout(timer);
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.found && data.channel) {
+        return {
+          channel: data.channel as UnifiedChannel,
+          streamIndex: typeof data.streamIndex === 'number' ? data.streamIndex : 0,
+        };
+      }
+    }
+  } catch {
+    // Fall back to client-side catalog lookup
+  }
+
+  try {
+    const fullCatalog = await getOfficialIptvOrgCatalogClient(false);
+    return matchChannelInListByStreamUrl(rawUrl, fullCatalog);
+  } catch {
+    return null;
+  }
+}
+

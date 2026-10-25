@@ -1,6 +1,6 @@
 {
-  "name": "StreamPulse — Universal IPTV & Data-Saver Studio",
+  "name": "IPTV VIP — Universal Live TV & Data-Saver Studio",
   "description": "Modern universal HTTP/HTTPS IPTV broadcast player with true 1080p–144p bandwidth control, live DVR recording, and M3U playlist management.",
-  "requestFramePermissions": ["microphone"],
+  "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

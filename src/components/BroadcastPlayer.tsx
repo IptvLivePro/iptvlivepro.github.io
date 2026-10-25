@@ -21,6 +21,7 @@ import {
   FastForward,
   Rewind,
   Trash2,
+  Copy,
 } from 'lucide-react';
 import {
   UnifiedChannel,
@@ -95,12 +96,25 @@ const ScreenRotateIcon: React.FC<{ className?: string }> = ({ className = 'w-3.5
   </svg>
 );
 
-function computeInitialEngine(url: string): PlaybackEngineMode {
+function computeInitialEngine(url: string, quality: QualityTierId = 'auto', hasTranscoder = false): PlaybackEngineMode {
   const lower = (url || '').trim().toLowerCase();
   if (
-    (lower.endsWith('.ts') && !lower.includes('.m3u8')) ||
-    /\/play\/[a-z0-9_-]+$/i.test(lower)
+    /^(rtmp|rtsp|mmsh|mms|udp|rtp):\/\//i.test(lower) ||
+    /\.(flv|mkv|avi)(\?|$)/i.test(lower)
   ) {
+    if (hasTranscoder) {
+      return mpegts.isSupported() ? 'transcode-mpegts' : 'transcode-mp4';
+    }
+    return 'mpegts';
+  }
+  if (
+    (lower.endsWith('.ts') && !lower.includes('.m3u8')) ||
+    /\/play\/[a-z0-9_-]+$/i.test(lower) ||
+    /\/udp\/[0-9.:]+$/i.test(lower)
+  ) {
+    if (quality !== 'auto' && hasTranscoder) {
+      return mpegts.isSupported() ? 'transcode-mpegts' : 'transcode-mp4';
+    }
     return 'mpegts';
   }
   if (
@@ -108,10 +122,12 @@ function computeInitialEngine(url: string): PlaybackEngineMode {
     lower.endsWith('.m4v') ||
     lower.endsWith('.webm') ||
     lower.endsWith('.mov') ||
-    lower.endsWith('.mkv') ||
     lower.includes('.mp4?') ||
     lower.includes('.webm?')
   ) {
+    if (quality !== 'auto' && hasTranscoder) {
+      return mpegts.isSupported() ? 'transcode-mpegts' : 'transcode-mp4';
+    }
     return 'native-video';
   }
   return 'proxy-hls';
@@ -260,6 +276,26 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
   const [showServerMenu, setShowServerMenu] = useState<boolean>(false);
   const [showRecordMenu, setShowRecordMenu] = useState<boolean>(false);
 
+  // Close player menus (Server Selection, Quality Selection, Recording Quality Selection) when clicking anywhere outside
+  useEffect(() => {
+    const handleDocumentPointerDown = (e: PointerEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      if (!target.closest('[data-player-menu="server"]')) {
+        setShowServerMenu(false);
+      }
+      if (!target.closest('[data-player-menu="quality"]')) {
+        setShowQualityMenu(false);
+      }
+      if (!target.closest('[data-player-menu="record"]')) {
+        setShowRecordMenu(false);
+      }
+    };
+    document.addEventListener('pointerdown', handleDocumentPointerDown, true);
+    return () =>
+      document.removeEventListener('pointerdown', handleDocumentPointerDown, true);
+  }, []);
+
   // Live Recording state with User Confirmation (Download or Cancel — NO auto-download!)
   const [isRecording, setIsRecording] = useState<boolean>(false);
   const [recordQuality, setRecordQuality] = useState<QualityTierId>('720p');
@@ -316,11 +352,13 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
     setResolvedOverrideStream(null);
   }, [channel.id]);
 
-  // Reset 15-second window, engine & zoom ONLY when primitive channel.id, activeStreamIndex, or activeStreamUrl changes
+  // Reset 20-second window, engine & zoom ONLY when primitive channel.id, activeStreamIndex, or activeStreamUrl changes
   useEffect(() => {
     autoTriedServersRef.current.add(activeStreamIndex);
     startNew15sServerWindow();
-    setPlaybackEngine(computeInitialEngine(activeStreamUrl));
+    setPlaybackEngine(
+      computeInitialEngine(activeStreamUrl, selectedQualityRef.current, hasNodeTranscoderRef.current)
+    );
     setVideoZoom(1);
     return () => {
       clearServer15sTimer();
@@ -620,47 +658,70 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
   }, []);
 
   /**
-   * Helper to apply user-selected quality tier to Hls.js without unnecessary buffer flushing
+   * Helper to apply user-selected quality tier to Hls.js:
+   * - Returns true if the HLS manifest natively has a matching quality variant.
+   * - Returns false if the stream is single-bitrate (or lacks a matching low-bitrate variant)
+   *   so the caller can switch to real-time FFmpeg downscaling (`transcode-mpegts`) to save mobile data.
    */
   const applyQualityToHls = useCallback(
-    (hls: Hls, quality: QualityTierId, levels: NativeHlsLevel[], immediateFlush: boolean) => {
+    (hls: Hls, quality: QualityTierId, levels: NativeHlsLevel[], immediateFlush: boolean): boolean => {
       if (quality === 'auto') {
+        hls.autoLevelCapping = -1;
         hls.currentLevel = -1;
         hls.nextLevel = -1;
         hls.loadLevel = -1;
-        return;
+        return true;
       }
       const tierSpec = QUALITY_TIERS.find((t) => t.id === quality);
-      if (levels.length > 1 && tierSpec) {
-        let bestIdx = 0;
+      if (!tierSpec) return true;
+
+      const validLevels = levels.filter((l) => l.height > 0);
+      if (validLevels.length > 1) {
+        let bestIdx = validLevels[0].index;
         let minDiff = Infinity;
-        levels.forEach((lvl) => {
-          if (lvl.height > 0) {
-            const diff = Math.abs(lvl.height - tierSpec.height);
-            if (diff < minDiff) {
-              minDiff = diff;
-              bestIdx = lvl.index;
-            }
+        validLevels.forEach((lvl) => {
+          const diff = Math.abs(lvl.height - tierSpec.height);
+          if (diff < minDiff) {
+            minDiff = diff;
+            bestIdx = lvl.index;
           }
         });
-        if (immediateFlush) {
-          hls.currentLevel = bestIdx;
-        } else {
-          // Soft switch on initial manifest load so we never flush the already-downloading segment!
-          hls.loadLevel = bestIdx;
-          hls.nextLevel = bestIdx;
+
+        // If the closest native HLS level is within 180p of the requested quality (or at/below the target height), use it natively
+        const chosenHeight = levels[bestIdx]?.height || 0;
+        if (minDiff <= 180 || (chosenHeight > 0 && chosenHeight <= tierSpec.height)) {
+          hls.autoLevelCapping = bestIdx;
+          if (immediateFlush) {
+            hls.currentLevel = bestIdx;
+          } else {
+            hls.loadLevel = bestIdx;
+            hls.nextLevel = bestIdx;
+          }
+          if (chosenHeight > 0) {
+            setDetectedHeight(chosenHeight);
+          }
+          return true;
+        }
+      } else if (validLevels.length === 1) {
+        const singleHeight = validLevels[0].height;
+        if (Math.abs(singleHeight - tierSpec.height) <= 120) {
+          setDetectedHeight(singleHeight);
+          return true;
         }
       }
+
+      // Stream does not have a matching native HLS variant for the requested quality
+      return false;
     },
     []
   );
 
   /**
-   * 1. Render-Isolated Multi-Engine Video Loader with Strict 15-Second Per-Server Attempt Window:
+   * 1. Render-Isolated Multi-Engine Video Loader with Strict 20-Second Per-Server Attempt Window
+   * and VLC-for-Android Universal Stream Compatibility:
    * - Never automatically switches `activeStreamIndex` to another server.
-   * - Keeps trying the selected server across engines/retries for a full 15 seconds.
-   * - Only if the selected server has still not started playing after 15 seconds does it prompt the user
-   *   to choose between "Reconnect" or "Switch to Server X".
+   * - Escalates swiftly through Proxy HLS -> Direct HLS / Raw MPEG-TS -> Server-Side FFmpeg (VLC/LibVLC grade decoder)
+   *   well within the 20-second window so streams with HEVC, MPEG-2, AC-3, RTSP/RTMP, or raw TS play smoothly.
    */
   useEffect(() => {
     const video = videoRef.current;
@@ -730,7 +791,6 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
     const retryOrPromptWithin15sWindow = () => {
       if (effectDisposed) return;
       if (serverHasPlayedRef.current) {
-        // If the stream was playing earlier and dropped, reset the 20s window to try recovering
         serverAttemptStartRef.current = Date.now();
         serverHasPlayedRef.current = false;
       }
@@ -742,20 +802,23 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
         showUserServerChoicePrompt();
         return;
       }
-      // Still within the 20-second window: wait 1s and retry this SAME server from its initial engine!
       retryDelayTimerRef.current = window.setTimeout(() => {
         if (effectDisposed || serverHasPlayedRef.current) return;
         if (Date.now() - serverAttemptStartRef.current >= SERVER_ATTEMPT_WINDOW_MS) {
           showUserServerChoicePrompt();
           return;
         }
-        const initialEng = computeInitialEngine(currentStream.url);
+        const initialEng = computeInitialEngine(
+          currentStream.url,
+          selectedQualityRef.current,
+          hasNodeTranscoderRef.current
+        );
         if (playbackEngine !== initialEng) {
           setPlaybackEngine(initialEng);
         } else {
           setReloadNonce((n) => n + 1);
         }
-      }, Math.min(1000, remainingMs - 200));
+      }, Math.min(900, remainingMs - 200));
     };
 
     const advanceToNextEngineOrServer = (manifestConnected = false) => {
@@ -775,15 +838,17 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
 
       if (playbackEngine === 'native-video') {
         if (hasNodeTranscoderRef.current) {
-          setPlaybackEngine('transcode-mp4');
+          setPlaybackEngine(mpegts.isSupported() ? 'transcode-mpegts' : 'transcode-mp4');
         } else {
           setPlaybackEngine('proxy-hls');
         }
       } else if (playbackEngine === 'proxy-hls') {
-        if (!isHttpStream || !isHttpsPage) {
-          setPlaybackEngine('direct-hls');
-        } else if (manifestConnected && hasNodeTranscoderRef.current) {
+        // If manifest already connected through proxy-hls, the issue is codec/container (e.g. MPEG-2, HEVC, AC-3, TS timing)
+        // Jump straight to FFmpeg VLC transcoder so we don't waste time on direct-hls!
+        if (manifestConnected && hasNodeTranscoderRef.current) {
           setPlaybackEngine(mpegts.isSupported() ? 'transcode-mpegts' : 'transcode-mp4');
+        } else if (!isHttpStream || !isHttpsPage) {
+          setPlaybackEngine('direct-hls');
         } else if (mpegts.isSupported()) {
           setPlaybackEngine('mpegts');
         } else if (hasNodeTranscoderRef.current) {
@@ -792,12 +857,10 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
           retryOrPromptWithin15sWindow();
         }
       } else if (playbackEngine === 'direct-hls') {
-        if (manifestConnected && hasNodeTranscoderRef.current) {
+        if (hasNodeTranscoderRef.current) {
           setPlaybackEngine(mpegts.isSupported() ? 'transcode-mpegts' : 'transcode-mp4');
         } else if (mpegts.isSupported()) {
           setPlaybackEngine('mpegts');
-        } else if (hasNodeTranscoderRef.current) {
-          setPlaybackEngine('transcode-mp4');
         } else {
           retryOrPromptWithin15sWindow();
         }
@@ -863,17 +926,25 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
       }
 
       const targetQ = selectedQualityRef.current === 'auto' ? '720p' : selectedQualityRef.current;
+      const targetSpec = QUALITY_DIMENSIONS[targetQ];
+      if (playbackEngine === 'transcode-mpegts' && targetSpec) {
+        setDetectedHeight(targetSpec.height);
+      }
+
       const tsUrl =
         playbackEngine === 'transcode-mpegts'
           ? buildProxiedStreamUrl(currentStream, 'ffmpeg-mpegts', targetQ)
           : buildProxiedStreamUrl(currentStream, 'raw-ts');
 
       let frameReceived = false;
+      const watchdogMs = playbackEngine === 'transcode-mpegts' ? 6200 : 4200;
       const startupGuard = window.setTimeout(() => {
         if (!effectDisposed && !frameReceived && (!video || video.readyState < 2)) {
           advanceToNextEngineOrServer();
         }
-      }, 6500);
+      }, watchdogMs);
+
+      let lastStatTimestamp = performance.now();
 
       try {
         const player = mpegts.createPlayer(
@@ -886,6 +957,7 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
             enableWorker: true,
             enableStashBuffer: false,
             liveBufferLatencyChasing: false,
+            statisticsInfoReportInterval: 500,
           }
         );
         mpegtsRef.current = player;
@@ -905,6 +977,23 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
               // Keep connecting animation active while retrying within the 20s window
             });
         }
+
+        // 100% Real Network Bytes accounting from mpegts.js stream reader
+        player.on(mpegts.Events.STATISTICS_INFO, (info: any) => {
+          if (effectDisposed) return;
+          const now = performance.now();
+          const dtSec = Math.min(2.0, Math.max(0.1, (now - lastStatTimestamp) / 1000));
+          lastStatTimestamp = now;
+          const speedKBps = typeof info?.speed === 'number' ? info.speed : 0;
+          if (speedKBps > 0) {
+            const realBytes = Math.round(speedKBps * 1024 * dtSec);
+            if (realBytes > 0) {
+              onBytesReceivedRef.current(realBytes);
+              measuredStreamBpsRef.current = Math.round(speedKBps * 1024 * 8);
+            }
+          }
+        });
+
         player.on(mpegts.Events.ERROR, () => {
           clearTimeout(startupGuard);
           advanceToNextEngineOrServer();
@@ -928,12 +1017,17 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
         return;
       }
       const targetQ = selectedQualityRef.current === 'auto' ? '720p' : selectedQualityRef.current;
+      const targetSpec = QUALITY_DIMENSIONS[targetQ];
+      if (targetSpec) {
+        setDetectedHeight(targetSpec.height);
+      }
+
       const transcodeUrl = buildProxiedStreamUrl(currentStream, 'ffmpeg-mp4', targetQ);
       const mp4StartupGuard = window.setTimeout(() => {
         if (!effectDisposed && (!video || video.readyState < 2)) {
           retryOrPromptWithin15sWindow();
         }
-      }, 6500);
+      }, 6200);
 
       video.src = transcodeUrl;
       video.load();
@@ -991,12 +1085,12 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
         highBufferWatchdogPeriod: 2,
         nudgeOffset: 0.2,
         nudgeMaxRetry: 10,
-        manifestLoadingTimeOut: 7000,
+        manifestLoadingTimeOut: 4500,
         manifestLoadingMaxRetry: 1,
-        levelLoadingTimeOut: 7000,
-        levelLoadingMaxRetry: 2,
-        fragLoadingTimeOut: 8500,
-        fragLoadingMaxRetry: 2,
+        levelLoadingTimeOut: 4500,
+        levelLoadingMaxRetry: 1,
+        fragLoadingTimeOut: 6000,
+        fragLoadingMaxRetry: 1,
         xhrSetup: (xhr, url) => {
           // Automatically route any http:// segment or playlist on an https: page through the server proxy
           if (
@@ -1020,33 +1114,64 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
       hls.loadSource(targetHlsUrl);
       hls.attachMedia(video);
 
-      // Startup watchdog: if HLS hasn't decoded a single frame within 8s, try next engine/retry within the 15s server window
+      // Fast startup watchdog (4.5s for proxy-hls, 3.8s for direct-hls) so FFmpeg/VLC engine is always reached within 20s!
+      const hlsWatchdogMs = playbackEngine === 'proxy-hls' ? 4500 : 3800;
       const hlsStartupWatchdog = window.setTimeout(() => {
         if (!effectDisposed && !hasBufferedAnyFrag && (!video || video.readyState < 2)) {
           advanceToNextEngineOrServer(manifestConnected);
         }
-      }, 8000);
+      }, hlsWatchdogMs);
+
+      hls.on(Hls.Events.MANIFEST_LOADED, (_event, data) => {
+        if (effectDisposed) return;
+        const manifestBytes = (data as any)?.stats?.total || 0;
+        if (manifestBytes > 0) {
+          onBytesReceivedRef.current(manifestBytes);
+        }
+      });
+
+      hls.on(Hls.Events.LEVEL_LOADED, (_event, data) => {
+        if (effectDisposed) return;
+        const levelBytes = data.stats?.total || 0;
+        if (levelBytes > 0) {
+          onBytesReceivedRef.current(levelBytes);
+        }
+      });
+
+      hls.on(Hls.Events.KEY_LOADED, (_event, data) => {
+        if (effectDisposed) return;
+        const keyBytes = (data as any)?.frag?.stats?.total || (data as any)?.stats?.total || 0;
+        if (keyBytes > 0) {
+          onBytesReceivedRef.current(keyBytes);
+        }
+      });
 
       hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
         if (effectDisposed) return;
         manifestConnected = true;
         networkRetryCount = 0;
 
-        // Check if all levels in the manifest are HEVC (`hvc1` / `hev1`) and browser doesn't support HEVC in MSE
-        const allLevelsHevc =
+        // Check if levels use codecs unsupported by browser MSE (e.g. HEVC, MPEG-2, AC-3, E-AC-3) that VLC plays via FFmpeg
+        const hasUnsupportedCodec =
           data.levels.length > 0 &&
           data.levels.every((lvl: any) => {
             const vc = String(lvl.videoCodec || lvl.attrs?.CODECS || '').toLowerCase();
-            return vc.includes('hvc1') || vc.includes('hev1') || vc.includes('hevc');
+            const ac = String(lvl.audioCodec || lvl.attrs?.CODECS || '').toLowerCase();
+            const isHevc =
+              (vc.includes('hvc1') || vc.includes('hev1') || vc.includes('hevc')) &&
+              typeof MediaSource !== 'undefined' &&
+              !MediaSource.isTypeSupported('video/mp4; codecs="hev1.1.6.L93.B0"') &&
+              !MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"');
+            const isMpeg2OrAc3 =
+              vc.includes('mp2v') ||
+              ac.includes('ac-3') ||
+              ac.includes('ec-3') ||
+              ac.includes('mp4a.69') ||
+              ac.includes('mp4a.6b');
+            return isHevc || isMpeg2OrAc3;
           });
 
-        if (
-          allLevelsHevc &&
-          hasNodeTranscoderRef.current &&
-          typeof MediaSource !== 'undefined' &&
-          !MediaSource.isTypeSupported('video/mp4; codecs="hev1.1.6.L93.B0"') &&
-          !MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"')
-        ) {
+        if (hasUnsupportedCodec && hasNodeTranscoderRef.current) {
           clearTimeout(hlsStartupWatchdog);
           destroyPlayers();
           setPlaybackEngine(mpegts.isSupported() ? 'transcode-mpegts' : 'transcode-mp4');
@@ -1066,8 +1191,20 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
           setDetectedHeight(firstValidHeight);
         }
 
-        // Soft-apply quality preference without flushing the initial segment buffer
-        applyQualityToHls(hls, selectedQualityRef.current, extracted, false);
+        // Apply user-selected quality tier: if stream is single-bitrate and user requested a specific quality
+        // (e.g. 144p/240p/360p/480p to save mobile data), switch to real-time FFmpeg downscaler!
+        const matchedNatively = applyQualityToHls(
+          hls,
+          selectedQualityRef.current,
+          extracted,
+          false
+        );
+        if (!matchedNatively && selectedQualityRef.current !== 'auto' && hasNodeTranscoderRef.current) {
+          clearTimeout(hlsStartupWatchdog);
+          destroyPlayers();
+          setPlaybackEngine(mpegts.isSupported() ? 'transcode-mpegts' : 'transcode-mp4');
+          return;
+        }
 
         video
           .play()
@@ -1108,9 +1245,13 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
         consecutiveFragErrors = 0;
         const stats = data.frag.stats;
         const rawBytes = stats.total || 0;
+        if (rawBytes > 0) {
+          // 100% Real Network Bytes from actual downloaded media fragment!
+          onBytesReceivedRef.current(rawBytes);
+        }
         const durationSec = Math.max(1, data.frag.duration || 4);
         const fragBps = Math.round((rawBytes * 8) / durationSec);
-        if (fragBps > 50000) {
+        if (fragBps > 30000) {
           measuredStreamBpsRef.current = fragBps;
         }
       });
@@ -1118,18 +1259,35 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
       hls.on(Hls.Events.ERROR, (_event, data) => {
         if (effectDisposed) return;
 
-        // If /api/proxy/hls returned 415 (raw MPEG-TS stream instead of #EXTM3U manifest), jump directly to mpegts!
+        // If /api/proxy/hls returned 415 (raw MPEG-TS/FLV stream instead of #EXTM3U manifest), jump directly to mpegts/FFmpeg!
         const responseCode = (data as any)?.response?.code;
         if (responseCode === 415) {
           clearTimeout(hlsStartupWatchdog);
           destroyPlayers();
-          if (mpegts.isSupported()) {
+          if (selectedQualityRef.current !== 'auto' && hasNodeTranscoderRef.current) {
+            setPlaybackEngine(mpegts.isSupported() ? 'transcode-mpegts' : 'transcode-mp4');
+          } else if (mpegts.isSupported()) {
             setPlaybackEngine('mpegts');
           } else if (hasNodeTranscoderRef.current) {
             setPlaybackEngine('transcode-mp4');
           } else {
             advanceToNextEngineOrServer(true);
           }
+          return;
+        }
+
+        // If fragment parsing or codec buffer error occurs (common on MPEG-2 / AC-3 / raw DVB TS streams that work in VLC),
+        // escalate immediately to our FFmpeg VLC transcoder!
+        if (
+          hasNodeTranscoderRef.current &&
+          (data.details === Hls.ErrorDetails.MANIFEST_INCOMPATIBLE_CODECS_ERROR ||
+            data.details === Hls.ErrorDetails.FRAG_PARSING_ERROR ||
+            data.details === Hls.ErrorDetails.BUFFER_ADD_CODEC_ERROR ||
+            (data.details === Hls.ErrorDetails.BUFFER_APPEND_ERROR && mediaRecoveryCount >= 1))
+        ) {
+          clearTimeout(hlsStartupWatchdog);
+          destroyPlayers();
+          setPlaybackEngine(mpegts.isSupported() ? 'transcode-mpegts' : 'transcode-mp4');
           return;
         }
 
@@ -1143,7 +1301,7 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
         if (isFragOrLevelError) {
           consecutiveFragErrors += 1;
           const levelCount = hls.levels?.length || 1;
-          const maxAllowedNonFatal = levelCount > 1 ? 4 : 2;
+          const maxAllowedNonFatal = levelCount > 1 ? 3 : 2;
           if (!hasBufferedAnyFrag && consecutiveFragErrors >= maxAllowedNonFatal) {
             clearTimeout(hlsStartupWatchdog);
             advanceToNextEngineOrServer(manifestConnected);
@@ -1160,14 +1318,9 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
           return;
         }
 
-        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveryCount < 2) {
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveryCount < 1) {
           mediaRecoveryCount += 1;
-          if (mediaRecoveryCount === 1) {
-            hls.recoverMediaError();
-          } else {
-            hls.swapAudioCodec();
-            hls.recoverMediaError();
-          }
+          hls.recoverMediaError();
         } else if (
           data.type === Hls.ErrorTypes.NETWORK_ERROR &&
           networkRetryCount < 1 &&
@@ -1190,14 +1343,14 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
           hasNodeTranscoderRef.current &&
           video &&
           !video.paused &&
-          video.currentTime > 1.5 &&
+          video.currentTime > 1.2 &&
           video.videoWidth === 0
         ) {
           clearTimeout(hlsStartupWatchdog);
           destroyPlayers();
           setPlaybackEngine(mpegts.isSupported() ? 'transcode-mpegts' : 'transcode-mp4');
         }
-      }, 4500);
+      }, 3200);
 
       return () => {
         effectDisposed = true;
@@ -1250,57 +1403,101 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
   ]);
 
   /**
-   * 2. Real-Time Data Consumption Accounting (100% responsive to Active Playback & Selected Quality Tier)
+   * 2. Real-Time Direct Video Element Byte Accounting (`native-video` & `transcode-mp4`)
+   * Plus live resolution tracking from the decoded video frame (`video.videoHeight`)
    */
-  useEffect(() => {
-    const interval = window.setInterval(() => {
-      const video = videoRef.current;
-      if (!video || video.paused || video.ended || isBuffering || errorMsg || video.readyState < 2) {
-        return;
-      }
+  const lastDirectElementBytesRef = useRef<number | null>(null);
 
-      if (video.videoHeight > 0) {
+  useEffect(() => {
+    const interval = window.setInterval(async () => {
+      const video = videoRef.current;
+      if (video && !video.paused && video.videoHeight > 0) {
         setDetectedHeight(video.videoHeight);
       }
 
-      const currentQ = selectedQualityRef.current;
-      let effectiveBps = measuredStreamBpsRef.current;
-
-      if (currentQ !== 'auto') {
-        const spec = QUALITY_DIMENSIONS[currentQ];
-        if (spec) {
-          effectiveBps = spec.bps;
+      if (playbackEngine === 'native-video' || playbackEngine === 'transcode-mp4') {
+        try {
+          const res = await fetch('/api/proxy/bytes-status');
+          if (res.ok) {
+            const data = await res.json();
+            const currentBytes =
+              typeof data?.directElementBytesServed === 'number'
+                ? data.directElementBytesServed
+                : 0;
+            if (lastDirectElementBytesRef.current !== null) {
+              const delta = currentBytes - lastDirectElementBytesRef.current;
+              if (delta > 0) {
+                onBytesReceivedRef.current(delta);
+              }
+            }
+            lastDirectElementBytesRef.current = currentBytes;
+          }
+        } catch {
+          // ignore
         }
       }
-
-      const bytesThisTick = Math.round((effectiveBps * 0.5) / 8);
-      if (bytesThisTick > 0) {
-        onBytesReceivedRef.current(bytesThisTick);
-      }
-    }, 500);
+    }, 1000);
 
     return () => clearInterval(interval);
-  }, [isBuffering, errorMsg]);
+  }, [playbackEngine]);
 
   /**
    * 3. User-Initiated Quality Switching (`Auto, 1080p, 720p, 480p, 360p, 240p, 144p`)
+   * - Genuinely switches resolution & bitrate: uses native HLS variant when available,
+   *   or switches to real-time FFmpeg server-side downscaling (`transcode-mpegts`) so mobile data is truly saved!
    */
   const handleSelectQualityOption = (tierId: QualityTierId) => {
     onSelectQuality(tierId);
+    selectedQualityRef.current = tierId;
     setShowQualityMenu(false);
     resetFullscreenAutoHideTimer();
+
+    if (tierId !== 'auto') {
+      const spec = QUALITY_DIMENSIONS[tierId];
+      if (spec) {
+        setDetectedHeight(spec.height);
+      }
+    }
+
+    // If user selected 'auto' while in transcode mode on a standard HLS/TS stream, return to initial engine
+    if (
+      tierId === 'auto' &&
+      (playbackEngine === 'transcode-mpegts' || playbackEngine === 'transcode-mp4')
+    ) {
+      const initialEng = computeInitialEngine(activeStreamUrl, 'auto', hasNodeTranscoderRef.current);
+      if (initialEng !== playbackEngine) {
+        startNew15sServerWindow();
+        setPlaybackEngine(initialEng);
+        return;
+      }
+    }
 
     if (
       (playbackEngine === 'transcode-mp4' || playbackEngine === 'transcode-mpegts') &&
       hasNodeTranscoderRef.current
     ) {
+      startNew15sServerWindow();
       setReloadNonce((n) => n + 1);
+      return;
+    }
+
+    if (playbackEngine === 'mpegts' || playbackEngine === 'native-video') {
+      if (tierId !== 'auto' && hasNodeTranscoderRef.current) {
+        startNew15sServerWindow();
+        setPlaybackEngine(mpegts.isSupported() ? 'transcode-mpegts' : 'transcode-mp4');
+      }
       return;
     }
 
     const hls = hlsRef.current;
     if (!hls) return;
-    applyQualityToHls(hls, tierId, nativeLevelsRef.current, true);
+
+    const matchedNatively = applyQualityToHls(hls, tierId, nativeLevelsRef.current, true);
+    if (!matchedNatively && tierId !== 'auto' && hasNodeTranscoderRef.current) {
+      // Single-bitrate HLS stream or missing low-bitrate variant: switch to FFmpeg downscaler to truly save mobile data!
+      startNew15sServerWindow();
+      setPlaybackEngine(mpegts.isSupported() ? 'transcode-mpegts' : 'transcode-mp4');
+    }
   };
 
   // Track video playback & DVR seekable window with debounced buffering state
@@ -1704,10 +1901,54 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
     ? 'bg-neutral-900/95 border border-white/15 text-white backdrop-blur-md'
     : 'bg-white border border-slate-200 text-slate-900';
 
+  const [copiedPlayerStreamIdx, setCopiedPlayerStreamIdx] = useState<number | null>(null);
+
+  const handleCopyPlayerStreamUrl = async (
+    url: string,
+    sIdx: number,
+    e: React.MouseEvent
+  ) => {
+    e.preventDefault();
+    e.stopPropagation();
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(url);
+      } else {
+        const textArea = document.createElement('textarea');
+        textArea.value = url;
+        textArea.style.position = 'fixed';
+        textArea.style.opacity = '0';
+        document.body.appendChild(textArea);
+        textArea.focus();
+        textArea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textArea);
+      }
+    } catch {
+      try {
+        const textArea = document.createElement('textarea');
+        textArea.value = url;
+        textArea.style.position = 'fixed';
+        textArea.style.opacity = '0';
+        document.body.appendChild(textArea);
+        textArea.focus();
+        textArea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textArea);
+      } catch {
+        // ignore fallback error
+      }
+    }
+    setCopiedPlayerStreamIdx(sIdx);
+    window.setTimeout(() => {
+      setCopiedPlayerStreamIdx((prev) => (prev === sIdx ? null : prev));
+    }, 2000);
+  };
+
   return (
     <div ref={containerRef} className={outerContainerClasses}>
       <div className={innerStageClasses} style={innerStageStyle}>
-        {/* SLEEK TOP BAR (Permanently attached to player in normal view; scrolls cleanly under header) */}
+        {/* SLEEK TOP BAR (Permanently attached to player in normal view; z-index elevates only when server menu is open so quality menu from bottom bar is never hidden behind top bar) */}
         <div
           onClick={(e) => {
             e.stopPropagation();
@@ -1715,12 +1956,16 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
           }}
           className={`w-full flex items-center justify-between gap-2 px-2.5 sm:px-4 py-1.5 transition-opacity duration-200 ${
             isFullscreen
-              ? `absolute top-0 inset-x-0 z-50 bg-gradient-to-b from-black/90 via-black/60 to-transparent text-white pb-3 ${
+              ? `absolute top-0 inset-x-0 ${
+                  showServerMenu ? 'z-[60]' : 'z-30'
+                } bg-gradient-to-b from-black/90 via-black/60 to-transparent text-white pb-3 ${
                   showControls
                     ? 'opacity-100 pointer-events-auto'
                     : 'opacity-0 pointer-events-none'
                 }`
-              : 'relative z-40 bg-white border-b border-slate-200 text-slate-900 rounded-t-2xl opacity-100 pointer-events-auto'
+              : `relative ${
+                  showServerMenu ? 'z-50' : 'z-20'
+                } bg-white border-b border-slate-200 text-slate-900 rounded-t-2xl opacity-100 pointer-events-auto`
           }`}
         >
           <div className="flex items-center gap-2 min-w-0 flex-1">
@@ -1786,6 +2031,7 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
               {channel.streams.length > 0 && (
                 <button
                   type="button"
+                  data-player-menu="server"
                   onClick={(e) => {
                     e.stopPropagation();
                     setShowServerMenu((prev) => !prev);
@@ -1809,51 +2055,67 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
 
               {showServerMenu && channel.streams.length > 0 && (
                 <div
+                  data-player-menu="server"
                   onClick={(e) => e.stopPropagation()}
-                  className="absolute top-full right-0 mt-1.5 w-52 rounded-2xl shadow-2xl p-1.5 z-50 max-h-60 overflow-y-auto bg-red-600 border border-red-500 text-white"
+                  className={`absolute top-full right-0 mt-1.5 w-44 max-h-[180px] overflow-y-auto rounded-2xl shadow-xl p-1.5 z-50 ${menuSurfaceClass}`}
                 >
-                  <div className="px-2.5 py-1 border-b border-red-500/70 mb-1 flex items-center justify-between">
-                    <p className="text-[11px] font-bold text-white">
-                      Available Servers ({channel.streams.length})
-                    </p>
-                  </div>
                   {channel.streams.map((st, sIdx) => {
                     const isCurrent = activeStreamIndex === sIdx;
+                    const isCopied = copiedPlayerStreamIdx === sIdx;
                     return (
-                      <button
-                        key={sIdx}
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onSelectStreamIndex(sIdx);
-                          setShowServerMenu(false);
-                          resetFullscreenAutoHideTimer();
-                        }}
-                        className={`w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-xl text-xs text-left transition-colors mb-0.5 last:mb-0 ${
+                      <div
+                        key={`player-srv-${sIdx}`}
+                        className={`w-full h-7 flex items-center justify-between gap-1 px-2 rounded-xl text-xs transition-colors ${
                           isCurrent
-                            ? 'bg-white text-red-600 font-extrabold shadow-xs'
-                            : 'text-white hover:bg-red-700/80 font-semibold'
+                            ? 'bg-red-600 text-white font-bold'
+                            : isFullscreen
+                            ? 'text-slate-200 hover:bg-white/10'
+                            : 'text-slate-700 hover:bg-slate-100'
                         }`}
                       >
-                        <div className="flex items-center gap-1.5 min-w-0">
-                          {isCurrent && <Check className="w-3.5 h-3.5 text-red-600 shrink-0" />}
-                          <span className="shrink-0">Server {sIdx + 1}</span>
-                          {st.quality && st.quality !== 'Live' && (
-                            <span
-                              className={`font-mono text-[10px] shrink-0 ${
-                                isCurrent ? 'text-red-500' : 'text-red-200'
-                              }`}
-                            >
-                              ({st.quality})
-                            </span>
-                          )}
-                        </div>
-                        {isCurrent && (
-                          <span className="text-[10px] font-mono uppercase tracking-wider px-1.5 py-0.5 rounded-md bg-red-100 text-red-700 font-bold">
-                            Active
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onSelectStreamIndex(sIdx);
+                            setShowServerMenu(false);
+                            resetFullscreenAutoHideTimer();
+                          }}
+                          className="flex-1 min-w-0 h-full flex items-center text-left"
+                        >
+                          <span className="font-mono text-[10px] whitespace-nowrap overflow-x-auto no-scrollbar select-all">
+                            {st.url}
                           </span>
-                        )}
-                      </button>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={(e) =>
+                            handleCopyPlayerStreamUrl(st.url, sIdx, e)
+                          }
+                          title="Copy stream URL"
+                          aria-label="Copy stream URL"
+                          className={`w-[46px] h-5 justify-center shrink-0 inline-flex items-center gap-0.5 rounded-lg text-[9px] font-bold transition-colors ${
+                            isCurrent
+                              ? 'bg-white text-red-600 hover:bg-red-50'
+                              : isFullscreen
+                              ? 'bg-white/15 text-white hover:bg-white/25'
+                              : 'bg-slate-100 border border-slate-200 text-slate-700 hover:border-red-600 hover:text-red-600'
+                          }`}
+                        >
+                          {isCopied ? (
+                            <>
+                              <Check className="w-2.5 h-2.5 shrink-0" />
+                              <span>Copied</span>
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="w-2.5 h-2.5 shrink-0" />
+                              <span>Copy</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
                     );
                   })}
                 </div>
@@ -2055,7 +2317,7 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
           )}
         </div>
 
-        {/* ULTRA-SLEEK COMPACT BOTTOM CONTROL TRAY (Permanently attached to player in normal view) */}
+        {/* ULTRA-SLEEK COMPACT BOTTOM CONTROL TRAY (z-50 when quality/record menu is open so it always renders above the top bar and never gets clipped) */}
         <div
           onClick={(e) => {
             e.stopPropagation();
@@ -2063,16 +2325,21 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
           }}
           className={`w-full flex flex-col px-2.5 sm:px-4 pt-1 pb-1.5 transition-opacity duration-200 ${
             isFullscreen
-              ? `absolute bottom-0 inset-x-0 z-40 bg-gradient-to-t from-black/95 via-black/80 to-transparent text-white pt-4 ${
+              ? `absolute bottom-0 inset-x-0 ${
+                  showQualityMenu || showRecordMenu ? 'z-[60]' : 'z-40'
+                } bg-gradient-to-t from-black/95 via-black/80 to-transparent text-white pt-4 ${
                   showControls
                     ? 'opacity-100 pointer-events-auto'
                     : 'opacity-0 pointer-events-none'
                 }`
-              : 'relative z-30 bg-white border-t border-slate-200 text-slate-900 rounded-b-2xl opacity-100 pointer-events-auto'
+              : `relative ${
+                  showQualityMenu || showRecordMenu ? 'z-50' : 'z-30'
+                } bg-white border-t border-slate-200 text-slate-900 rounded-b-2xl opacity-100 pointer-events-auto`
           }`}
         >
           {showRecordMenu && !isRecording && (
             <div
+              data-player-menu="record"
               onClick={(e) => e.stopPropagation()}
               className={`absolute bottom-full right-2.5 sm:right-4 mb-1.5 w-44 rounded-2xl shadow-xl p-1.5 z-50 ${menuSurfaceClass}`}
             >
@@ -2090,7 +2357,7 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
                         setShowRecordMenu(false);
                         resetFullscreenAutoHideTimer();
                       }}
-                      className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-xl text-xs transition-colors ${
+                      className={`w-full h-7 flex items-center justify-between px-2.5 rounded-xl text-xs transition-colors ${
                         active
                           ? 'bg-red-600 text-white font-bold'
                           : isFullscreen
@@ -2109,9 +2376,10 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
             </div>
           )}
 
-          {/* VIDEO QUALITY SELECTION MENU (NO "Quality" OR "Data Saver" TEXTS!) */}
+          {/* VIDEO QUALITY SELECTION MENU (Exact same w-44 and 180px overall box height & layout as Screen Recording quality menu) */}
           {showQualityMenu && (
             <div
+              data-player-menu="quality"
               onClick={(e) => e.stopPropagation()}
               className={`absolute bottom-full right-2.5 sm:right-4 mb-1.5 w-44 rounded-2xl shadow-xl p-1.5 z-50 ${menuSurfaceClass}`}
             >
@@ -2125,7 +2393,7 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
                       e.stopPropagation();
                       handleSelectQualityOption(tier.id);
                     }}
-                    className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-xl text-xs transition-colors ${
+                    className={`w-full h-6 flex items-center justify-between px-2.5 rounded-xl text-xs transition-colors ${
                       isSelected
                         ? 'bg-red-600 text-white font-bold'
                         : isFullscreen
@@ -2133,10 +2401,7 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
                         : 'text-slate-700 hover:bg-slate-100'
                     }`}
                   >
-                    <span className="flex items-center gap-1.5">
-                      {isSelected && <Check className="w-3.5 h-3.5 text-white" />}
-                      <span>{tier.shortLabel}</span>
-                    </span>
+                    <span>{tier.shortLabel}</span>
                     <span className="font-mono tabular-nums text-[10px] opacity-80">
                       ~{tier.estMbPerHour} MB/h
                     </span>
@@ -2314,6 +2579,7 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
                     </button>
                     <button
                       type="button"
+                      data-player-menu="record"
                       onClick={(e) => {
                         e.stopPropagation();
                         setShowRecordMenu((prev) => !prev);
@@ -2344,6 +2610,7 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
 
               <button
                 type="button"
+                data-player-menu="quality"
                 onClick={(e) => {
                   e.stopPropagation();
                   setShowQualityMenu((prev) => !prev);

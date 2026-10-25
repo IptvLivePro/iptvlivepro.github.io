@@ -9,7 +9,6 @@ import {
   ChevronDown,
   Check,
   Loader2,
-  Mic,
   Copy,
 } from 'lucide-react';
 import {
@@ -19,6 +18,8 @@ import {
 import {
   queryOfficialCatalogWithFallback,
   resetClientCatalogCache,
+  findChannelByStreamUrl,
+  matchChannelInListByStreamUrl,
 } from './utils/iptvCatalogClient';
 import { BroadcastPlayer, PlayerStageMode } from './components/BroadcastPlayer';
 
@@ -248,9 +249,20 @@ export default function App() {
   const [sessionBytes, setSessionBytes] = useState<number>(0);
 
   useEffect(() => {
-    const handleOutsideClick = () => setOpenServerMenuChannelId(null);
-    window.addEventListener('click', handleOutsideClick);
-    return () => window.removeEventListener('click', handleOutsideClick);
+    const handleDocumentPointerDown = (e: PointerEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      const menuEl = target.closest('[data-card-server-menu]');
+      setOpenServerMenuChannelId((prev) => {
+        if (!prev) return null;
+        if (!menuEl) return null;
+        const clickedId = menuEl.getAttribute('data-card-server-menu');
+        return clickedId === prev ? prev : null;
+      });
+    };
+    document.addEventListener('pointerdown', handleDocumentPointerDown, true);
+    return () =>
+      document.removeEventListener('pointerdown', handleDocumentPointerDown, true);
   }, []);
 
   useEffect(() => {
@@ -258,6 +270,13 @@ export default function App() {
     const t = window.setTimeout(() => setUnavailableNoticeChannel(null), 4000);
     return () => clearTimeout(t);
   }, [unavailableNoticeChannel]);
+
+  const channelsRef = useRef<UnifiedChannel[]>(channels);
+  channelsRef.current = channels;
+  const favoriteChannelsRef = useRef<UnifiedChannel[]>(favoriteChannels);
+  favoriteChannelsRef.current = favoriteChannels;
+  const favoriteIdsRef = useRef<string[]>(favoriteIds);
+  favoriteIdsRef.current = favoriteIds;
 
   const isDirectStreamUrlInput = useCallback((raw: string): boolean => {
     const trimmed = raw.trim();
@@ -269,6 +288,32 @@ export default function App() {
     (rawUrl: string) => {
       const cleanUrl = rawUrl.trim();
       if (!cleanUrl) return;
+
+      setUnavailableNoticeChannel(null);
+      setIsSearching(false);
+
+      const currentPool = [
+        ...channelsRef.current,
+        ...favoriteChannelsRef.current,
+      ];
+
+      // 1. Check immediately against already loaded channels & favorites
+      const immediateMatch = matchChannelInListByStreamUrl(cleanUrl, currentPool);
+      if (immediateMatch) {
+        setCardSelectedServer((prev) => ({
+          ...prev,
+          [immediateMatch.channel.id]: immediateMatch.streamIndex,
+        }));
+        setActiveChannel(immediateMatch.channel);
+        setActiveStreamIndex(immediateMatch.streamIndex);
+        if (playerStageMode !== 'fullscreen') {
+          setPlayerStageMode('theater');
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+        }
+        return;
+      }
+
+      // 2. Start playing immediately with fallback info while looking up full library details
       let hostLabel = 'Direct Stream';
       try {
         const u = new URL(cleanUrl);
@@ -291,14 +336,38 @@ export default function App() {
         logos: [],
         streams: [{ url: cleanUrl, quality: 'Live' }],
       };
-      setUnavailableNoticeChannel(null);
       setActiveChannel(directChannel);
       setActiveStreamIndex(0);
-      setIsSearching(false);
       if (playerStageMode !== 'fullscreen') {
         setPlayerStageMode('theater');
         window.scrollTo({ top: 0, behavior: 'smooth' });
       }
+
+      // 3. Look up the stream URL in the full iptv-org library (server + client catalog)
+      // If found, upgrade activeChannel with the real library channel details (logo, name, country, categories, languages, servers)
+      findChannelByStreamUrl(cleanUrl, [
+        ...channelsRef.current,
+        ...favoriteChannelsRef.current,
+      ])
+        .then((found) => {
+          if (!found) return;
+          setCardSelectedServer((prev) => ({
+            ...prev,
+            [found.channel.id]: found.streamIndex,
+          }));
+          setActiveChannel((current) => {
+            if (!current) return current;
+            if (
+              current.id === `direct-url-${cleanUrl}` ||
+              current.id.toLowerCase() === found.channel.id.toLowerCase()
+            ) {
+              return found.channel;
+            }
+            return current;
+          });
+          setActiveStreamIndex(found.streamIndex);
+        })
+        .catch(() => {});
     },
     [playerStageMode]
   );
@@ -314,7 +383,8 @@ export default function App() {
       filter: CategoryFilterId,
       offset: number,
       append = false,
-      forceRefresh = false
+      forceRefresh = false,
+      silent = false
     ) => {
       const reqId = ++latestRequestIdRef.current;
 
@@ -324,10 +394,15 @@ export default function App() {
         filter !== 'all' || isDirectStreamUrlInput(rawTrimmed) ? '' : rawTrimmed;
       const qLower = effectiveQuery.toLowerCase();
 
-      setLoadingChannels(true);
+      if (!silent) {
+        setLoadingChannels(true);
+      }
       setLoadError(null);
 
-      if (filter === 'favorites' && favoriteIds.length === 0) {
+      const currentFavIds = favoriteIdsRef.current;
+      const currentFavChannels = favoriteChannelsRef.current;
+
+      if (filter === 'favorites' && currentFavIds.length === 0) {
         setChannels([]);
         setTotalMatches(0);
         setLoadingChannels(false);
@@ -344,7 +419,7 @@ export default function App() {
           offset,
           fetchLimit,
           forceRefresh,
-          filter === 'favorites' ? favoriteIds : []
+          filter === 'favorites' ? currentFavIds : []
         );
         if (reqId !== latestRequestIdRef.current) return;
 
@@ -353,10 +428,10 @@ export default function App() {
 
         let favFiltered = streamFiltered;
         if (filter === 'favorites') {
-          const favSetLower = new Set(favoriteIds.map((id) => id.toLowerCase()));
+          const favSetLower = new Set(currentFavIds.map((id) => id.toLowerCase()));
           const combinedFavMap = new Map<string, UnifiedChannel>();
 
-          for (const savedCh of favoriteChannels) {
+          for (const savedCh of currentFavChannels) {
             if (savedCh && savedCh.id && favSetLower.has(savedCh.id.toLowerCase())) {
               combinedFavMap.set(savedCh.id.toLowerCase(), savedCh);
             }
@@ -398,13 +473,18 @@ export default function App() {
         }
       }
     },
-    [favoriteIds, favoriteChannels, isDirectStreamUrlInput]
+    [isDirectStreamUrlInput]
   );
+
+  const playDirectStreamUrlRef = useRef(playDirectStreamUrl);
+  playDirectStreamUrlRef.current = playDirectStreamUrl;
+
+  const favFilterKey = catalogFilter === 'favorites' ? favoriteIds.join(',') : '';
 
   useEffect(() => {
     const trimmed = searchQuery.trim();
     if (isDirectStreamUrlInput(trimmed)) {
-      playDirectStreamUrl(trimmed);
+      playDirectStreamUrlRef.current(trimmed);
       return;
     }
 
@@ -412,15 +492,21 @@ export default function App() {
       setPageOffset(0);
       const shouldForceReset = !initialResetDoneRef.current;
       initialResetDoneRef.current = true;
-      loadChannels(searchQuery, catalogFilter, 0, false, shouldForceReset);
+      loadChannels(searchQuery, catalogFilter, 0, false, shouldForceReset, false);
     }, 80);
     return () => clearTimeout(timer);
-  }, [searchQuery, catalogFilter, loadChannels, isDirectStreamUrlInput, playDirectStreamUrl]);
+  }, [
+    searchQuery,
+    catalogFilter,
+    favFilterKey,
+    loadChannels,
+    isDirectStreamUrlInput,
+  ]);
 
   useEffect(() => {
     const syncTimer = window.setInterval(() => {
       if (pageOffset === 0 && !isDirectStreamUrlInput(searchQuery)) {
-        loadChannels(searchQuery, catalogFilter, 0, false, false);
+        loadChannels(searchQuery, catalogFilter, 0, false, false, true);
       }
     }, 5 * 60 * 1000);
     return () => clearInterval(syncTimer);
@@ -539,513 +625,25 @@ export default function App() {
     }, 2000);
   };
 
-  const [isListeningVoice, setIsListeningVoice] = useState<boolean>(false);
-  const [voiceStatusText, setVoiceStatusText] = useState<string>('Speak now');
-  const [voiceInterimText, setVoiceInterimText] = useState<string>('');
-  const [voiceVolumeLevel, setVoiceVolumeLevel] = useState<number>(0);
-
-  const recognitionRef = useRef<any>(null);
-  const micStreamRef = useRef<MediaStream | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const rafVolumeRef = useRef<number | null>(null);
-  const silenceTimeoutRef = useRef<number | null>(null);
-  const hasRecognitionTranscriptRef = useRef<boolean>(false);
-  const isStoppingVoiceRef = useRef<boolean>(false);
-  const isTranscribingVoiceRef = useRef<boolean>(false);
-  const voiceCancelledRef = useRef<boolean>(false);
-
-  const playVoiceChime = (type: 'start' | 'end' | 'error') => {
-    try {
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-      if (!AudioCtx) return;
-      const ctx = new AudioCtx();
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-
-      const now = ctx.currentTime;
-      if (type === 'start') {
-        osc.frequency.setValueAtTime(523.25, now); // C5
-        osc.frequency.setValueAtTime(659.25, now + 0.08); // E5
-        gain.gain.setValueAtTime(0.08, now);
-        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
-        osc.start(now);
-        osc.stop(now + 0.22);
-      } else if (type === 'end') {
-        osc.frequency.setValueAtTime(659.25, now); // E5
-        osc.frequency.setValueAtTime(783.99, now + 0.07); // G5
-        gain.gain.setValueAtTime(0.08, now);
-        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.2);
-        osc.start(now);
-        osc.stop(now + 0.2);
-      } else {
-        osc.frequency.setValueAtTime(349.23, now); // F4
-        osc.frequency.setValueAtTime(293.66, now + 0.09); // D4
-        gain.gain.setValueAtTime(0.07, now);
-        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
-        osc.start(now);
-        osc.stop(now + 0.22);
-      }
-      setTimeout(() => {
-        ctx.close().catch(() => {});
-      }, 300);
-    } catch {
-      // ignore audio context restrictions
-    }
-  };
-
-  const stopAudioMeterAndStreams = () => {
-    if (rafVolumeRef.current) {
-      cancelAnimationFrame(rafVolumeRef.current);
-      rafVolumeRef.current = null;
-    }
-    if (silenceTimeoutRef.current) {
-      window.clearTimeout(silenceTimeoutRef.current);
-      silenceTimeoutRef.current = null;
-    }
-    if (micStreamRef.current) {
-      micStreamRef.current.getTracks().forEach((track) => {
-        try {
-          track.stop();
-        } catch {
-          // ignore
-        }
-      });
-      micStreamRef.current = null;
-    }
-    if (audioContextRef.current) {
-      try {
-        audioContextRef.current.close();
-      } catch {
-        // ignore
-      }
-      audioContextRef.current = null;
-    }
-    setVoiceVolumeLevel(0);
-  };
-
-  const cleanupVoiceResources = () => {
-    stopAudioMeterAndStreams();
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.onresult = null;
-        recognitionRef.current.onerror = null;
-        recognitionRef.current.onend = null;
-        recognitionRef.current.stop();
-      } catch {
-        // ignore
-      }
-      recognitionRef.current = null;
-    }
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      try {
-        mediaRecorderRef.current.onstop = null;
-        mediaRecorderRef.current.stop();
-      } catch {
-        // ignore
-      }
-    }
-    mediaRecorderRef.current = null;
-    isTranscribingVoiceRef.current = false;
-  };
-
-  useEffect(() => {
-    return () => {
-      cleanupVoiceResources();
-    };
-  }, []);
-
-  const applyRecognizedVoiceQuery = (rawText: string) => {
-    const cleaned = rawText
-      .replace(/^["'`]+|["'`.,!?]+$/g, '')
-      .replace(/\s+/g, ' ')
-      .trim();
-    if (!cleaned) return false;
-    hasRecognitionTranscriptRef.current = true;
-    setVoiceInterimText(cleaned);
-    setVoiceStatusText(cleaned);
-    setSearchQuery(cleaned);
-    if (isDirectStreamUrlInput(cleaned)) {
-      playDirectStreamUrl(cleaned);
-      return true;
-    }
-    if (catalogFilter !== 'all') {
-      setCatalogFilter('all');
-    }
-    setIsSearching(true);
-    loadChannels(cleaned, 'all', 0, false, false);
-    return true;
-  };
-
-  const stopVoiceSearchSession = (cancelOnly = false) => {
-    if (cancelOnly) {
-      voiceCancelledRef.current = true;
-      cleanupVoiceResources();
-      setIsListeningVoice(false);
-      setVoiceInterimText('');
-      setVoiceStatusText('Speak now');
-      isStoppingVoiceRef.current = false;
-      return;
-    }
-
-    if (isStoppingVoiceRef.current || isTranscribingVoiceRef.current) return;
-    isStoppingVoiceRef.current = true;
-
-    // Stop volume animation loop immediately so it cannot re-trigger stopVoiceSearchSession
-    if (rafVolumeRef.current) {
-      cancelAnimationFrame(rafVolumeRef.current);
-      rafVolumeRef.current = null;
-    }
-    if (silenceTimeoutRef.current) {
-      window.clearTimeout(silenceTimeoutRef.current);
-      silenceTimeoutRef.current = null;
-    }
-    setVoiceVolumeLevel(0);
-
-    // If SpeechRecognition already produced a final/interim query, finalize immediately
-    if (hasRecognitionTranscriptRef.current) {
-      playVoiceChime('end');
-      cleanupVoiceResources();
-      setIsListeningVoice(false);
-      isStoppingVoiceRef.current = false;
-      return;
-    }
-
-    // If MediaRecorder is recording phone microphone audio, stop it so recorder.onstop
-    // sends the recorded voice to /api/voice-search and populates the search box
-    if (
-      mediaRecorderRef.current &&
-      mediaRecorderRef.current.state === 'recording'
-    ) {
-      isTranscribingVoiceRef.current = true;
-      setVoiceStatusText('Recognizing...');
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.stop();
-        } catch {
-          // ignore
-        }
-      }
-      try {
-        mediaRecorderRef.current.stop();
-        isStoppingVoiceRef.current = false;
-        return;
-      } catch {
-        isTranscribingVoiceRef.current = false;
-      }
-    }
-
-    // If only SpeechRecognition was active without MediaRecorder, let it finalize
-    if (recognitionRef.current) {
-      setVoiceStatusText('Recognizing...');
-      try {
-        recognitionRef.current.stop();
-      } catch {
-        // ignore
-      }
-      window.setTimeout(() => {
-        cleanupVoiceResources();
-        setIsListeningVoice(false);
-        isStoppingVoiceRef.current = false;
-      }, 600);
-      return;
-    }
-
-    cleanupVoiceResources();
-    setIsListeningVoice(false);
-    isStoppingVoiceRef.current = false;
-  };
-
-  const startFallbackSpeechRecognition = () => {
-    const SpeechRecognitionApi =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognitionApi) return false;
-
-    try {
-      const recognition = new SpeechRecognitionApi();
-      recognitionRef.current = recognition;
-      recognition.continuous = false;
-      recognition.interimResults = true;
-      recognition.lang = navigator.language || 'en-US';
-
-      recognition.onstart = () => {
-        setVoiceStatusText('Listening...');
-      };
-
-      recognition.onresult = (event: any) => {
-        let transcript = '';
-        let isFinal = false;
-        for (let i = 0; i < event.results.length; i++) {
-          transcript += event.results[i][0].transcript;
-          if (event.results[i].isFinal) {
-            isFinal = true;
-          }
-        }
-        const cleaned = transcript.replace(/[.,!?]+$/g, '').trim();
-        if (cleaned) {
-          applyRecognizedVoiceQuery(cleaned);
-        }
-        if (isFinal && cleaned) {
-          playVoiceChime('end');
-          window.setTimeout(() => {
-            cleanupVoiceResources();
-            setIsListeningVoice(false);
-          }, 350);
-        }
-      };
-
-      recognition.onerror = () => {
-        if (!mediaRecorderRef.current && !isTranscribingVoiceRef.current) {
-          cleanupVoiceResources();
-          setIsListeningVoice(false);
-        }
-      };
-
-      recognition.onend = () => {
-        if (hasRecognitionTranscriptRef.current) {
-          playVoiceChime('end');
-          window.setTimeout(() => {
-            cleanupVoiceResources();
-            setIsListeningVoice(false);
-          }, 250);
-        } else if (!mediaRecorderRef.current && !isTranscribingVoiceRef.current) {
-          cleanupVoiceResources();
-          setIsListeningVoice(false);
-        }
-      };
-
-      recognition.start();
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
-  const handleToggleVoiceSearch = async (e: React.MouseEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-
-    // If already listening, tapping the Mic button finishes & transcribes the spoken query
-    if (isListeningVoice) {
-      stopVoiceSearchSession(false);
-      return;
-    }
-
-    hasRecognitionTranscriptRef.current = false;
-    isStoppingVoiceRef.current = false;
-    isTranscribingVoiceRef.current = false;
-    voiceCancelledRef.current = false;
-    setVoiceInterimText('');
-    setVoiceStatusText('Listening...');
-    setIsListeningVoice(true);
-    playVoiceChime('start');
-
-    // Primary: Activate the user's phone/device hardware microphone via getUserMedia
-    // without running SpeechRecognition simultaneously (which locks out the mic on Android)
-    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-        });
-
-        if (voiceCancelledRef.current) {
-          stream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-
-        micStreamRef.current = stream;
-        setVoiceStatusText('Listening...');
-
-        // Setup Web Audio Time-Domain RMS Analyser for accurate voice detection on phone mics
-        const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-        if (AudioCtx) {
-          const audioCtx = new AudioCtx();
-          audioContextRef.current = audioCtx;
-          if (audioCtx.state === 'suspended') {
-            audioCtx.resume().catch(() => {});
-          }
-          const source = audioCtx.createMediaStreamSource(stream);
-          const analyser = audioCtx.createAnalyser();
-          analyser.fftSize = 512;
-          source.connect(analyser);
-
-          const timeData = new Uint8Array(analyser.fftSize);
-          let spokeAtLeastOnce = false;
-          let silenceStart = 0;
-          let speechStart = 0;
-          const startedAt = performance.now();
-
-          const updateVolume = () => {
-            if (
-              !micStreamRef.current ||
-              voiceCancelledRef.current ||
-              isTranscribingVoiceRef.current
-            ) {
-              return;
-            }
-
-            analyser.getByteTimeDomainData(timeData);
-            let sumSquares = 0;
-            for (let i = 0; i < timeData.length; i++) {
-              const centered = (timeData[i] - 128) / 128;
-              sumSquares += centered * centered;
-            }
-            const rms = Math.sqrt(sumSquares / timeData.length);
-            const normalized = Math.min(1, rms * 6.5);
-            setVoiceVolumeLevel(normalized);
-
-            const now = performance.now();
-            // RMS > 0.022 reliably detects human voice on phone & desktop microphones
-            if (rms > 0.022) {
-              if (!spokeAtLeastOnce) {
-                spokeAtLeastOnce = true;
-                speechStart = now;
-              }
-              silenceStart = 0;
-              // Auto-transcribe if user speaks continuously for more than 5.5 seconds
-              if (speechStart && now - speechStart > 5500) {
-                stopVoiceSearchSession(false);
-                return;
-              }
-            } else if (spokeAtLeastOnce) {
-              if (!silenceStart) {
-                silenceStart = now;
-              } else if (now - silenceStart > 900) {
-                // User finished speaking (0.9s pause) — immediately transcribe & put in search box
-                stopVoiceSearchSession(false);
-                return;
-              }
-            } else if (now - startedAt > 6500) {
-              // Auto-stop after 6.5s even if RMS was subtle so quiet mics still get transcribed
-              stopVoiceSearchSession(false);
-              return;
-            }
-
-            rafVolumeRef.current = requestAnimationFrame(updateVolume);
-          };
-
-          rafVolumeRef.current = requestAnimationFrame(updateVolume);
-        }
-
-        // Record from the phone microphone and transcribe via /api/voice-search
-        if (typeof MediaRecorder !== 'undefined') {
-          const preferredTypes = [
-            'audio/webm;codecs=opus',
-            'audio/webm',
-            'audio/mp4',
-            'audio/ogg;codecs=opus',
-          ];
-          let selectedMime = '';
-          for (const t of preferredTypes) {
-            if (MediaRecorder.isTypeSupported(t)) {
-              selectedMime = t;
-              break;
-            }
-          }
-
-          const recorder = selectedMime
-            ? new MediaRecorder(stream, { mimeType: selectedMime })
-            : new MediaRecorder(stream);
-          mediaRecorderRef.current = recorder;
-          const chunks: BlobPart[] = [];
-
-          recorder.ondataavailable = (ev) => {
-            if (ev.data && ev.data.size > 0) {
-              chunks.push(ev.data);
-            }
-          };
-
-          recorder.onstop = async () => {
-            // Stop hardware mic tracks immediately now that audio chunks are captured
-            stopAudioMeterAndStreams();
-
-            if (voiceCancelledRef.current || hasRecognitionTranscriptRef.current) {
-              cleanupVoiceResources();
-              setIsListeningVoice(false);
-              return;
-            }
-
-            const blob = new Blob(chunks, {
-              type: recorder.mimeType || selectedMime || 'audio/webm',
-            });
-
-            if (blob.size < 200) {
-              cleanupVoiceResources();
-              setIsListeningVoice(false);
-              return;
-            }
-
-            setVoiceStatusText('Recognizing...');
-            try {
-              const base64Audio = await new Promise<string>((resolve, reject) => {
-                const reader = new FileReader();
-                reader.onloadend = () => {
-                  const res = String(reader.result || '');
-                  const commaIdx = res.indexOf(',');
-                  resolve(commaIdx >= 0 ? res.slice(commaIdx + 1) : res);
-                };
-                reader.onerror = reject;
-                reader.readAsDataURL(blob);
-              });
-
-              const resp = await fetch('/api/voice-search', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  audioBase64: base64Audio,
-                  mimeType: blob.type || 'audio/webm',
-                }),
-              });
-
-              if (resp.ok) {
-                const data = await resp.json();
-                if (data?.transcript && applyRecognizedVoiceQuery(data.transcript)) {
-                  playVoiceChime('end');
-                  window.setTimeout(() => {
-                    cleanupVoiceResources();
-                    setIsListeningVoice(false);
-                  }, 350);
-                  return;
-                }
-              }
-
-              setVoiceStatusText("Didn't catch that. Try again.");
-              playVoiceChime('error');
-              window.setTimeout(() => {
-                cleanupVoiceResources();
-                setIsListeningVoice(false);
-              }, 900);
-            } catch {
-              playVoiceChime('error');
-              cleanupVoiceResources();
-              setIsListeningVoice(false);
-            }
-          };
-
-          recorder.start(150);
-          return;
-        }
-      } catch {
-        // If getUserMedia fails or isn't permitted, fall back to browser SpeechRecognition
-      }
-    }
-
-    if (!startFallbackSpeechRecognition()) {
-      playVoiceChime('error');
-      cleanupVoiceResources();
-      setIsListeningVoice(false);
-    }
-  };
-
   const showSearchLoading =
-    (isSearching || (loadingChannels && searchQuery.trim().length > 0)) &&
-    !isDirectStreamUrlInput(searchQuery);
+    isSearching && !isDirectStreamUrlInput(searchQuery);
+
+  // Pin currently playing channel card to the very top (index 0) of the channel cards list
+  const displayedChannels = React.useMemo(() => {
+    if (!activeChannel) return channels;
+    const activeIdLower = activeChannel.id.toLowerCase();
+    const existing = channels.find((c) => c.id.toLowerCase() === activeIdLower);
+    if (existing) {
+      return [
+        existing,
+        ...channels.filter((c) => c.id.toLowerCase() !== activeIdLower),
+      ];
+    }
+    if (catalogFilter === 'all' && !activeChannel.id.startsWith('direct-url-')) {
+      return [activeChannel, ...channels];
+    }
+    return channels;
+  }, [channels, activeChannel, catalogFilter]);
 
   return (
     <div className="min-h-screen flex flex-col bg-[#F4F6F9] text-slate-900">
@@ -1062,10 +660,10 @@ export default function App() {
           }}
           className="font-display text-lg sm:text-xl font-bold tracking-tight text-red-600 whitespace-nowrap shrink-0"
         >
-          StreamPulse
+          IPTV VIP
         </a>
 
-        {/* HEADER SEARCH BOX (CONSTANT FIXED WIDTH, LEFT TV ICON & RIGHT SEARCH ICON, SWITCHES TO ALL CHANNELS ON CLICK) */}
+        {/* HEADER SEARCH BOX (CONSTANT FIXED WIDTH, LEFT TV ICON & SINGLE STATEFUL RIGHT ICON, SHOWS FULL 'Search channels...') */}
         <form
           onClick={() => {
             if (catalogFilter !== 'all') {
@@ -1085,7 +683,7 @@ export default function App() {
             setIsSearching(true);
             loadChannels(searchQuery, 'all', 0, false, false);
           }}
-          className="inline-flex items-center w-[150px] sm:w-[168px] bg-red-600 border border-red-700 focus-within:border-red-800 focus-within:ring-2 focus-within:ring-red-500/30 rounded-full pl-2.5 pr-1 py-1 transition-colors shrink-0 overflow-hidden"
+          className="inline-flex items-center w-[172px] sm:w-[190px] bg-red-600 border border-red-700 focus-within:border-red-800 focus-within:ring-2 focus-within:ring-red-500/30 rounded-full pl-2.5 pr-1 py-1 transition-colors shrink-0 overflow-hidden"
         >
           <Tv className="w-3.5 h-3.5 text-white/95 shrink-0 mr-1.5 pointer-events-none" />
           <input
@@ -1117,47 +715,50 @@ export default function App() {
             }}
             placeholder="Search channels..."
             aria-label="Search Channels or Paste Stream URL"
-            className="flex-1 min-w-0 w-full p-0 m-0 bg-transparent border-none text-xs sm:text-sm font-medium text-white placeholder-white/95 focus:outline-none leading-tight"
+            className="flex-1 min-w-0 w-full p-0 m-0 bg-transparent border-none text-xs font-medium text-white placeholder-white/95 focus:outline-none leading-tight"
           />
 
-          {/* Right-side icons immediately next to 'Search channels...' with zero gap */}
-          <div className="flex items-center shrink-0 ml-0">
+          {/* Single Right-Side Icon Slot: Search Icon (idle) -> Loading Spinner (loading) -> Cross Icon (when query/result present) */}
+          <div className="flex items-center shrink-0 ml-0.5">
             {showSearchLoading ? (
-              <div className="p-0.5 flex items-center justify-center pointer-events-none">
-                <Loader2 className="w-3.5 h-3.5 text-white animate-spin" />
+              <div
+                title="Searching..."
+                aria-label="Searching..."
+                className="p-1 flex items-center justify-center pointer-events-none"
+              >
+                <Loader2 className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-white animate-spin" />
               </div>
+            ) : searchQuery.length > 0 ? (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  const wasDirectUrl = isDirectStreamUrlInput(searchQuery);
+                  setSearchQuery('');
+                  if (catalogFilter !== 'all') {
+                    setCatalogFilter('all');
+                  }
+                  if (!wasDirectUrl) {
+                    setIsSearching(true);
+                  }
+                  searchInputRef.current?.focus();
+                }}
+                title="Clear search"
+                aria-label="Clear search"
+                className="p-1 rounded-full text-white hover:bg-red-700 transition-colors flex items-center justify-center"
+              >
+                <X className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+              </button>
             ) : (
-              searchQuery.length > 0 && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    const wasDirectUrl = isDirectStreamUrlInput(searchQuery);
-                    setSearchQuery('');
-                    if (catalogFilter !== 'all') {
-                      setCatalogFilter('all');
-                    }
-                    if (!wasDirectUrl) {
-                      setIsSearching(true);
-                    }
-                    searchInputRef.current?.focus();
-                  }}
-                  title="Clear search"
-                  aria-label="Clear search"
-                  className="p-0.5 rounded-full text-white/90 hover:text-white hover:bg-red-700 transition-colors"
-                >
-                  <X className="w-3.5 h-3.5" />
-                </button>
-              )
+              <button
+                type="submit"
+                title="Search channels"
+                aria-label="Search channels"
+                className="p-1 rounded-full text-white hover:bg-red-700 transition-all flex items-center justify-center"
+              >
+                <Search className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+              </button>
             )}
-
-            <button
-              type="submit"
-              title="Search channels"
-              aria-label="Search channels"
-              className="p-1 rounded-full text-white hover:bg-red-700 transition-all flex items-center justify-center"
-            >
-              <Search className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
-            </button>
           </div>
         </form>
 
@@ -1303,7 +904,7 @@ export default function App() {
                 Retry Loading Channels
               </button>
             </div>
-          ) : channels.length === 0 ? (
+          ) : displayedChannels.length === 0 ? (
             <div className="bg-white border border-slate-200 rounded-2xl p-10 text-center space-y-2">
               <Tv className="w-8 h-8 text-slate-400 mx-auto" />
               <p className="text-base font-bold text-slate-800">
@@ -1317,9 +918,10 @@ export default function App() {
             </div>
           ) : (
             <div className="space-y-1.5 sm:space-y-2">
-              {channels.map((ch) => {
+              {displayedChannels.map((ch) => {
                 const hasStreams = ch.streams.length > 0;
-                const isSelected = activeChannel?.id === ch.id;
+                const isSelected =
+                  activeChannel?.id.toLowerCase() === ch.id.toLowerCase();
                 const isFav = favoriteIds.some(
                   (favId) => favId.toLowerCase() === ch.id.toLowerCase()
                 );
@@ -1441,6 +1043,7 @@ export default function App() {
 
                               <button
                                 type="button"
+                                data-card-server-menu={ch.id}
                                 onClick={(e) => {
                                   e.stopPropagation();
                                   setOpenServerMenuChannelId((prev) =>
@@ -1466,6 +1069,7 @@ export default function App() {
                     {/* Smooth Push-Down Accordion for Stream URL Selection (pushes lower channel cards down instead of overlaying) */}
                     {hasStreams && (
                       <div
+                        data-card-server-menu={ch.id}
                         onClick={(e) => e.stopPropagation()}
                         className={`grid transition-all duration-300 ease-in-out ${
                           isServerMenuOpen

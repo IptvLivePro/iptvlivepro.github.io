@@ -9,7 +9,6 @@ import { URL } from 'url';
 import path from 'path';
 import { spawn } from 'child_process';
 import ffmpegPath from 'ffmpeg-static';
-import { GoogleGenAI } from '@google/genai';
 
 const PORT = 3000;
 
@@ -27,6 +26,11 @@ const DEFAULT_BROWSER_UA =
 const streamHealthScore = new Map<string, number>();
 const streamVerifyStatus = new Map<string, 'alive' | 'dead'>();
 const inFlightProbes = new Map<string, Promise<boolean>>();
+const hostWorkingProfileMap = new Map<string, number>();
+
+// Real-time byte counters for 100% accurate mobile data consumption accounting
+let totalProxyBytesServed = 0;
+let directElementBytesServed = 0;
 
 function recordStreamOutcome(url: string, ok: boolean) {
   if (!url) return;
@@ -39,27 +43,46 @@ function isManifestContent(text: string): boolean {
   const cleaned = text.replace(/^\uFEFF/, '').trimStart();
   return (
     cleaned.startsWith('#EXTM3U') ||
-    cleaned.slice(0, 512).includes('#EXTM3U') ||
-    cleaned.slice(0, 512).includes('#EXT-X-TargetDuration') ||
-    cleaned.slice(0, 512).includes('#EXT-X-TARGETDURATION') ||
-    cleaned.slice(0, 512).includes('#EXT-X-STREAM-INF') ||
-    cleaned.slice(0, 512).includes('#EXTINF:')
+    cleaned.slice(0, 1024).includes('#EXTM3U') ||
+    cleaned.slice(0, 1024).includes('#EXT-X-TargetDuration') ||
+    cleaned.slice(0, 1024).includes('#EXT-X-TARGETDURATION') ||
+    cleaned.slice(0, 1024).includes('#EXT-X-STREAM-INF') ||
+    cleaned.slice(0, 1024).includes('#EXTINF:')
   );
+}
+
+/**
+ * Scans the first 376 bytes for MPEG-TS 0x47 sync bytes spaced 188 bytes apart, or FLV magic header
+ */
+function hasMpegTsOrFlvSync(buf: Buffer): boolean {
+  if (buf.length >= 4 && buf[0] === 0x46 && buf[1] === 0x4c && buf[2] === 0x56 && buf[3] === 0x01) {
+    return true;
+  }
+  const limit = Math.min(188, buf.length - 188);
+  for (let i = 0; i < limit; i++) {
+    if (buf[i] === 0x47 && buf[i + 188] === 0x47) {
+      if (buf.length >= i + 377) {
+        if (buf[i + 376] === 0x47) return true;
+      } else {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 function isBinarySegmentUrl(targetUrl: string): boolean {
   try {
     const parsed = new URL(targetUrl);
     const p = parsed.pathname.toLowerCase();
-    return /\.(ts|m4s|mp4|aac|m4a|cmfv|cmfa|key|vtt|webvtt)$/i.test(p);
+    return /\.(ts|m4s|mp4|aac|m4a|cmfv|cmfa|key|vtt|webvtt|flv|mkv)$/i.test(p);
   } catch {
     return false;
   }
 }
 
 /**
- * Helper to perform HTTP/HTTPS requests with redirect following and clean headers.
- * Never injects unrequested Origin/Referer headers on cross-origin redirects.
+ * Helper to perform HTTP/HTTPS requests with redirect following, Set-Cookie preservation, and clean headers.
  */
 function fetchUpstream(
   targetUrl: string,
@@ -99,6 +122,10 @@ function fetchUpstream(
       reqHeaders['Referer'] = customHeaders['referer'];
     }
 
+    if (customHeaders['cookie']) {
+      reqHeaders['Cookie'] = customHeaders['cookie'];
+    }
+
     const options: https.RequestOptions = {
       protocol: parsed.protocol,
       hostname: parsed.hostname,
@@ -125,6 +152,15 @@ function fetchUpstream(
         }
 
         const nextHeaders = { ...customHeaders };
+        const setCookie = res.headers['set-cookie'];
+        if (Array.isArray(setCookie) && setCookie.length > 0) {
+          const cookiePairs = setCookie.map((c) => c.split(';')[0].trim()).filter(Boolean);
+          if (cookiePairs.length > 0) {
+            nextHeaders['cookie'] = [nextHeaders['cookie'], ...cookiePairs]
+              .filter(Boolean)
+              .join('; ');
+          }
+        }
         return resolve(fetchUpstream(nextUrl, nextHeaders, redirectsLeft - 1, timeoutMs));
       }
 
@@ -156,6 +192,9 @@ function decodeBufferIfCompressed(buf: Buffer, contentEncoding = ''): Buffer {
     }
     if (enc.includes('deflate')) {
       return zlib.inflateSync(buf);
+    }
+    if (enc.includes('br')) {
+      return zlib.brotliDecompressSync(buf);
     }
   } catch {
     // return original buffer if decompression fails
@@ -1249,41 +1288,137 @@ async function startServer() {
   });
 
   /**
-   * Smart Multi-Profile Upstream Connector
+   * Lookup full channel metadata from the library by stream URL (/api/iptv-org/lookup-stream)
+   */
+  app.get('/api/iptv-org/lookup-stream', async (req: Request, res: Response) => {
+    try {
+      const rawUrl = String(req.query.url || '').trim();
+      if (!rawUrl) {
+        res.status(400).json({ found: false });
+        return;
+      }
+
+      const normExact = (u: string): string => {
+        const t = (u || '').trim();
+        if (!t) return '';
+        try {
+          const parsed = new URL(t);
+          return `${parsed.protocol.toLowerCase()}//${parsed.host.toLowerCase()}${parsed.pathname.replace(/\/+$/, '')}${parsed.search}`;
+        } catch {
+          return t.replace(/\/+$/, '').toLowerCase();
+        }
+      };
+
+      const normNoQuery = (u: string): string => {
+        const t = (u || '').trim();
+        if (!t) return '';
+        try {
+          const parsed = new URL(t);
+          return `${parsed.protocol.toLowerCase()}//${parsed.host.toLowerCase()}${parsed.pathname.replace(/\/+$/, '')}`;
+        } catch {
+          return t.split('?')[0].replace(/\/+$/, '').toLowerCase();
+        }
+      };
+
+      const targetExact = normExact(rawUrl);
+      const targetNoQuery = normNoQuery(rawUrl);
+
+      const catalog = await syncOfficialIptvOrgCatalog(false);
+
+      for (const ch of catalog) {
+        for (let i = 0; i < ch.streams.length; i++) {
+          if (normExact(ch.streams[i].url) === targetExact) {
+            res.json({ found: true, channel: ch, streamIndex: i });
+            return;
+          }
+        }
+      }
+
+      if (targetNoQuery && targetNoQuery.split('/').length >= 4) {
+        for (const ch of catalog) {
+          for (let i = 0; i < ch.streams.length; i++) {
+            if (normNoQuery(ch.streams[i].url) === targetNoQuery) {
+              res.json({ found: true, channel: ch, streamIndex: i });
+              return;
+            }
+          }
+        }
+      }
+
+      res.json({ found: false });
+    } catch {
+      res.json({ found: false });
+    }
+  });
+
+  /**
+   * Real-time proxy network byte counter endpoint (/api/proxy/bytes-status)
+   */
+  app.get('/api/proxy/bytes-status', (_req: Request, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.json({
+      totalProxyBytesServed,
+      directElementBytesServed,
+    });
+  });
+
+  /**
+   * Smart Multi-Profile Upstream Connector with VLC for Android (Videolabs) Compatibility
    */
   async function fetchUpstreamWithProfiles(
     rawUrl: string,
     baseHeaders: Record<string, string>,
     customReferrer: string,
-    customUa: string
+    customUa: string,
+    perProfileTimeoutMs = 4500
   ) {
     let parsedOrigin = '';
+    let parsedHost = '';
     try {
-      parsedOrigin = new URL(rawUrl).origin;
+      const u = new URL(rawUrl);
+      parsedOrigin = u.origin;
+      parsedHost = u.host.toLowerCase();
     } catch {
       // ignore
     }
 
-    const profiles: Array<{
+    const vlcAndroidUa = 'VLC/3.5.4 LibVLC/3.5.4 (Linux; Android 13)';
+    const vlcDesktopUa = 'VLC/3.0.20 LibVLC/3.0.20';
+
+    const allProfiles: Array<{
+      id: number;
       headers: Record<string, string>;
       propagateReferer: string;
       propagateUa: string;
     }> = [
-      // Profile 1: Clean Browser UA (only sends Referer if index.m3u explicitly specified one!)
+      // Profile 0: Explicit Custom UA/Referer (if specified in M3U) or VLC for Android (Videolabs)
       {
+        id: 0,
+        headers: {
+          ...baseHeaders,
+          'user-agent': customUa || vlcAndroidUa,
+          ...(customReferrer ? { referer: customReferrer } : {}),
+        },
+        propagateReferer: customReferrer,
+        propagateUa: customUa || vlcAndroidUa,
+      },
+      // Profile 1: Clean Browser UA (with explicit Referer if provided)
+      {
+        id: 1,
         headers: {
           ...baseHeaders,
           'user-agent': customUa || DEFAULT_BROWSER_UA,
           ...(customReferrer ? { referer: customReferrer } : {}),
         },
         propagateReferer: customReferrer,
-        propagateUa: customUa,
+        propagateUa: customUa || DEFAULT_BROWSER_UA,
       },
-      // Profile 2: VLC/3.0.20 with Origin Referer
+      // Profile 2: VLC/3.0.20 LibVLC with Origin Referer
       {
+        id: 2,
         headers: {
           ...baseHeaders,
-          'user-agent': 'VLC/3.0.20 LibVLC/3.0.20',
+          'user-agent': vlcDesktopUa,
           ...(customReferrer
             ? { referer: customReferrer }
             : parsedOrigin
@@ -1291,18 +1426,44 @@ async function startServer() {
             : {}),
         },
         propagateReferer: customReferrer || (parsedOrigin ? `${parsedOrigin}/` : ''),
-        propagateUa: 'VLC/3.0.20 LibVLC/3.0.20',
+        propagateUa: vlcDesktopUa,
       },
-      // Profile 3: Android ExoPlayer IPTV User-Agent (no Referer)
+      // Profile 3: Browser UA with Origin Referer (for CDN hotlink-protected streams)
       {
+        id: 3,
         headers: {
           ...baseHeaders,
-          'user-agent': 'plaYtv/7.0.5 (Linux;Android 9) ExoPlayerLib/2.10.4',
+          'user-agent': DEFAULT_BROWSER_UA,
+          ...(customReferrer
+            ? { referer: customReferrer }
+            : parsedOrigin
+            ? { referer: `${parsedOrigin}/` }
+            : {}),
+        },
+        propagateReferer: customReferrer || (parsedOrigin ? `${parsedOrigin}/` : ''),
+        propagateUa: DEFAULT_BROWSER_UA,
+      },
+      // Profile 4: Android ExoPlayer / Lavf FFmpeg IPTV User-Agent
+      {
+        id: 4,
+        headers: {
+          ...baseHeaders,
+          'user-agent': 'Lavf/60.16.100',
         },
         propagateReferer: '',
-        propagateUa: 'plaYtv/7.0.5 (Linux;Android 9) ExoPlayerLib/2.10.4',
+        propagateUa: 'Lavf/60.16.100',
       },
     ];
+
+    // Reorder profiles to try the known-working profile for this host first
+    const cachedWinnerId = parsedHost ? hostWorkingProfileMap.get(parsedHost) : undefined;
+    const profiles =
+      cachedWinnerId !== undefined
+        ? [
+            ...allProfiles.filter((p) => p.id === cachedWinnerId),
+            ...allProfiles.filter((p) => p.id !== cachedWinnerId),
+          ]
+        : allProfiles;
 
     let lastUpstream: Awaited<ReturnType<typeof fetchUpstream>> | null = null;
     let lastErr: any = null;
@@ -1310,14 +1471,22 @@ async function startServer() {
     for (let i = 0; i < profiles.length; i++) {
       const p = profiles[i];
       try {
-        const up = await fetchUpstream(rawUrl, p.headers, 8, 5000);
-        if (up.statusCode < 400) {
+        const up = await fetchUpstream(rawUrl, p.headers, 8, perProfileTimeoutMs);
+        const cType = String(up.headers['content-type'] || '').toLowerCase();
+
+        // Reject anti-leech HTML block pages masquerading as 200 OK so we fall through to the next UA profile!
+        const isHtmlBlockPage = cType.includes('text/html');
+
+        if (up.statusCode < 400 && !isHtmlBlockPage) {
           recordStreamOutcome(rawUrl, true);
+          if (parsedHost) {
+            hostWorkingProfileMap.set(parsedHost, p.id);
+          }
           return {
             upstream: up,
             usedUa: p.propagateUa,
             usedReferer: p.propagateReferer,
-            effectiveUaForFfmpeg: p.headers['user-agent'] || DEFAULT_BROWSER_UA,
+            effectiveUaForFfmpeg: p.headers['user-agent'] || vlcAndroidUa,
             effectiveRefererForFfmpeg: p.headers['referer'] || '',
           };
         }
@@ -1327,7 +1496,7 @@ async function startServer() {
         }
         lastUpstream = up;
 
-        if (![400, 401, 403, 404, 406].includes(up.statusCode)) {
+        if (!isHtmlBlockPage && ![400, 401, 403, 404, 405, 406, 429, 500, 502, 503].includes(up.statusCode)) {
           break;
         }
       } catch (err: any) {
@@ -1352,7 +1521,7 @@ async function startServer() {
         upstream: lastUpstream,
         usedUa: customUa,
         usedReferer: customReferrer,
-        effectiveUaForFfmpeg: customUa || DEFAULT_BROWSER_UA,
+        effectiveUaForFfmpeg: customUa || vlcAndroidUa,
         effectiveRefererForFfmpeg: customReferrer,
       };
     }
@@ -1361,13 +1530,15 @@ async function startServer() {
 
   /**
    * Universal HTTP & HTTPS HLS, MPEG-TS & Media Stream Proxy (/api/proxy/hls & /api/proxy/stream)
-   * Properly distinguishes binary media segments from HLS manifests and decompresses complete manifests before #EXTM3U validation.
+   * Properly distinguishes binary media segments from HLS manifests and tracks real network bytes.
    */
   app.get(['/api/proxy/hls', '/api/proxy/stream'], async (req: Request, res: Response) => {
     const rawUrl = String(req.query.url || '').trim();
     const customReferrer = String(req.query.referrer || '').trim();
     const customUa = String(req.query.ua || '').trim();
     const expectManifest = String(req.query.expect || '') === 'manifest';
+    const isInternalFfmpeg = String(req.query.internal || '') === '1';
+    const isDirectVideoRoute = req.path === '/api/proxy/stream';
 
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader(
@@ -1379,6 +1550,15 @@ async function startServer() {
       res.status(400).json({ error: 'Missing url query parameter' });
       return;
     }
+
+    const accountBytes = (len: number) => {
+      if (len > 0 && !isInternalFfmpeg) {
+        totalProxyBytesServed += len;
+        if (isDirectVideoRoute) {
+          directElementBytesServed += len;
+        }
+      }
+    };
 
     try {
       const forwardHeaders: Record<string, string> = {};
@@ -1416,12 +1596,13 @@ async function startServer() {
         (isBinarySegmentUrl(upstream.finalUrl) ||
           contentType.includes('video/mp2t') ||
           contentType.includes('video/mp4') ||
+          contentType.includes('video/x-flv') ||
           contentType.includes('video/iso.segment') ||
           (contentType.includes('audio/') && !contentType.includes('mpegurl')));
 
       res.setHeader('X-Final-Url', upstream.finalUrl);
 
-      // Fast-path: direct zero-copy piping for known binary segments (.ts, .m4s, .aac, .mp4, .key)
+      // Fast-path: direct piping for known binary segments (.ts, .m4s, .aac, .mp4, .key)
       if (isKnownBinarySegment) {
         res.status(upstream.statusCode);
         res.setHeader('Content-Type', upstream.headers['content-type'] || 'video/mp2t');
@@ -1432,6 +1613,9 @@ async function startServer() {
           res.setHeader('Content-Range', upstream.headers['content-range']);
         }
         res.setHeader('Cache-Control', 'no-cache');
+        upstream.stream.on('data', (chunk: Buffer) => {
+          accountBytes(chunk.length);
+        });
         upstream.stream.pipe(res);
         req.on('close', () => {
           upstream.stream.destroy();
@@ -1439,7 +1623,7 @@ async function startServer() {
         return;
       }
 
-      // Otherwise inspect first chunk for HLS manifest vs binary media stream
+      // Otherwise inspect initial bytes for HLS manifest vs binary media stream
       let mode: 'undecided' | 'manifest' | 'binary' = 'undecided';
       const manifestChunks: Buffer[] = [];
       let totalManifestBytes = 0;
@@ -1447,15 +1631,21 @@ async function startServer() {
 
       upstream.stream.on('data', (chunk: Buffer) => {
         if (mode === 'undecided') {
-          const isMpegTsSync =
-            chunk.length >= 189 && chunk[0] === 0x47 && chunk[188] === 0x47;
+          manifestChunks.push(chunk);
+          totalManifestBytes += chunk.length;
+          const combinedInitial = Buffer.concat(manifestChunks);
 
-          if (isMpegTsSync) {
+          // Wait until we have at least 380 bytes before deciding if it's binary MPEG-TS vs manifest
+          if (combinedInitial.length < 380 && !isManifestContent(combinedInitial.toString('utf-8'))) {
+            return;
+          }
+
+          if (hasMpegTsOrFlvSync(combinedInitial)) {
             if (expectManifest) {
               upstream.stream.destroy();
               if (!res.headersSent) {
                 res.status(415).json({
-                  error: 'Raw MPEG-TS stream requires MPEG-TS or Transcode engine',
+                  error: 'Raw MPEG-TS/FLV stream requires MPEG-TS or Transcode engine',
                 });
               }
               return;
@@ -1464,15 +1654,21 @@ async function startServer() {
             res.status(upstream.statusCode);
             res.setHeader('Content-Type', upstream.headers['content-type'] || 'video/mp2t');
             res.setHeader('Cache-Control', 'no-cache');
-            res.write(chunk);
+            accountBytes(combinedInitial.length);
+            res.write(combinedInitial);
             return;
           }
 
-          const isGzipMagic = chunk.length >= 2 && chunk[0] === 0x1f && chunk[1] === 0x8b;
+          const isGzipMagic =
+            combinedInitial.length >= 2 &&
+            combinedInitial[0] === 0x1f &&
+            combinedInitial[1] === 0x8b;
 
-          // When not explicitly expecting a manifest, check if this chunk starts with #EXTM3U (or is compressed / m3u8)
           if (!expectManifest && !contentEncoding && !isGzipMagic && !isManifestMimeOrExt) {
-            const preview = chunk.slice(0, Math.min(chunk.length, 512)).toString('utf-8').trimStart();
+            const preview = combinedInitial
+              .slice(0, Math.min(combinedInitial.length, 512))
+              .toString('utf-8')
+              .trimStart();
             const looksLikeManifest =
               preview.startsWith('#EXTM3U') ||
               preview.includes('#EXT-X-') ||
@@ -1488,12 +1684,14 @@ async function startServer() {
                 res.setHeader('Content-Length', upstream.headers['content-length']);
               }
               res.setHeader('Cache-Control', 'no-cache');
-              res.write(chunk);
+              accountBytes(combinedInitial.length);
+              res.write(combinedInitial);
               return;
             }
           }
 
           mode = 'manifest';
+          return;
         }
 
         if (mode === 'manifest') {
@@ -1501,7 +1699,6 @@ async function startServer() {
           if (totalManifestBytes <= MAX_MANIFEST_SIZE) {
             manifestChunks.push(chunk);
           } else if (expectManifest) {
-            // Exceeded 5MB without finishing: this is an infinite raw stream, not a playlist
             upstream.stream.destroy();
             if (!res.headersSent) {
               res.status(415).json({
@@ -1510,6 +1707,7 @@ async function startServer() {
             }
           }
         } else {
+          accountBytes(chunk.length);
           const canContinue = res.write(chunk);
           if (!canContinue) {
             upstream.stream.pause();
@@ -1519,27 +1717,33 @@ async function startServer() {
       });
 
       upstream.stream.on('end', () => {
-        if (mode === 'manifest' && !res.headersSent) {
+        if ((mode === 'manifest' || mode === 'undecided') && !res.headersSent) {
           const rawBuf = Buffer.concat(manifestChunks);
           const decodedBuf = decodeBufferIfCompressed(rawBuf, contentEncoding);
           const fullText = decodedBuf.toString('utf-8');
 
           if (isManifestContent(fullText)) {
-            const rewritten = rewriteHlsManifest(
+            let rewritten = rewriteHlsManifest(
               fullText,
               upstream.finalUrl,
               usedReferer,
               usedUa
             );
+            if (isInternalFfmpeg) {
+              rewritten = rewritten.replace(/\/api\/proxy\/hls\?url=/g, `http://127.0.0.1:${PORT}/api/proxy/hls?internal=1&url=`);
+            }
+            const outBuf = Buffer.from(rewritten, 'utf-8');
+            accountBytes(outBuf.length);
             res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
             res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
-            res.status(200).send(rewritten);
+            res.status(200).send(outBuf);
           } else if (expectManifest) {
             recordStreamOutcome(rawUrl, false);
             res.status(415).json({
               error: 'Upstream response is not a valid HLS manifest',
             });
           } else {
+            accountBytes(decodedBuf.length);
             res.setHeader('Content-Type', contentType || 'application/octet-stream');
             res.status(upstream.statusCode).send(decodedBuf);
           }
@@ -1569,7 +1773,9 @@ async function startServer() {
   });
 
   /**
-   * Real-Time FFmpeg H.264 + AAC Universal Transcoder (/api/proxy/transcode)
+   * Real-Time FFmpeg H.264 + AAC Universal Transcoder & Mobile Data-Saver Downscaler (/api/proxy/transcode)
+   * Decodes any VLC-compatible stream (HEVC, MPEG-2, AC-3, E-AC-3, RTSP, RTMP, FLV, MPEG-TS, HLS)
+   * and downscales to exact 1080p/720p/480p/360p/240p/144p bitrates to genuinely save mobile data!
    */
   app.get('/api/proxy/transcode', async (req: Request, res: Response) => {
     const rawUrl = String(req.query.url || '').trim();
@@ -1584,47 +1790,43 @@ async function startServer() {
     }
 
     const preset = QUALITY_FFMPEG_PRESETS[quality] || QUALITY_FFMPEG_PRESETS['720p'];
+    const audioBitrate =
+      preset.height <= 240 ? '64k' : preset.height <= 480 ? '96k' : '128k';
 
-    let targetInputUrl = rawUrl;
-    let effectiveUa = customUa || DEFAULT_BROWSER_UA;
-    let effectiveReferer = customReferrer;
-
-    try {
-      const probed = await fetchUpstreamWithProfiles(rawUrl, {}, customReferrer, customUa);
-      probed.upstream.stream.destroy();
-      if (probed.upstream.statusCode < 400) {
-        targetInputUrl = probed.upstream.finalUrl || rawUrl;
-        effectiveUa = probed.effectiveUaForFfmpeg;
-        effectiveReferer = probed.effectiveRefererForFfmpeg;
-      }
-    } catch {
-      // Fall back to direct rawUrl if probe fails
-    }
-
-    const headerLines: string[] = [];
-    if (effectiveReferer) {
-      headerLines.push(`Referer: ${effectiveReferer}`);
-    }
+    // Route HTTP/HTTPS streams through our local proxy so FFmpeg gets automatic VLC User-Agent profiles,
+    // self-signed SSL cert bypass, cookie-preserving redirects, and token inheritance!
+    const isHttpOrHttps = /^https?:\/\//i.test(rawUrl);
+    const extraQuery =
+      (customReferrer ? `&referrer=${encodeURIComponent(customReferrer)}` : '') +
+      (customUa ? `&ua=${encodeURIComponent(customUa)}` : '');
+    const targetInputUrl = isHttpOrHttps
+      ? `http://127.0.0.1:${PORT}/api/proxy/hls?internal=1&url=${encodeURIComponent(rawUrl)}${extraQuery}`
+      : rawUrl;
 
     const ffmpegArgs: string[] = [
       '-loglevel',
       'error',
       '-analyzeduration',
-      '1500000',
+      '1200000',
       '-probesize',
-      '1500000',
+      '1200000',
       '-fflags',
       '+genpts+discardcorrupt+igndts+nobuffer',
-      '-user_agent',
-      effectiveUa,
     ];
 
-    if (headerLines.length > 0) {
-      ffmpegArgs.push('-headers', headerLines.join('\r\n') + '\r\n');
-    }
-
-    if (targetInputUrl.startsWith('http://') || targetInputUrl.startsWith('https://')) {
-      ffmpegArgs.push('-rw_timeout', '10000000');
+    if (/^rtsp:\/\//i.test(rawUrl)) {
+      ffmpegArgs.push('-rtsp_transport', 'tcp');
+    } else if (isHttpOrHttps) {
+      ffmpegArgs.push(
+        '-reconnect',
+        '1',
+        '-reconnect_streamed',
+        '1',
+        '-reconnect_delay_max',
+        '2',
+        '-rw_timeout',
+        '12000000'
+      );
     }
 
     ffmpegArgs.push(
@@ -1639,7 +1841,7 @@ async function startServer() {
       '-vf',
       `scale=-2:${preset.height}`,
       '-r',
-      '30',
+      preset.height <= 240 ? '24' : '30',
       '-c:v',
       'libx264',
       '-preset',
@@ -1663,7 +1865,7 @@ async function startServer() {
       '-c:a',
       'aac',
       '-b:a',
-      '128k',
+      audioBitrate,
       '-ar',
       '44100',
       '-ac',
@@ -1672,7 +1874,13 @@ async function startServer() {
 
     if (format === 'mpegts') {
       res.setHeader('Content-Type', 'video/mp2t');
-      ffmpegArgs.push('-f', 'mpegts', 'pipe:1');
+      ffmpegArgs.push(
+        '-f',
+        'mpegts',
+        '-mpegts_flags',
+        '+resend_headers+initial_discontinuity',
+        'pipe:1'
+      );
     } else {
       res.setHeader('Content-Type', 'video/mp4');
       ffmpegArgs.push(
@@ -1688,6 +1896,13 @@ async function startServer() {
 
     const ffProc = spawn(ffmpegPath as unknown as string, ffmpegArgs, {
       stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    ffProc.stdout.on('data', (chunk: Buffer) => {
+      totalProxyBytesServed += chunk.length;
+      if (format !== 'mpegts') {
+        directElementBytesServed += chunk.length;
+      }
     });
 
     ffProc.stdout.pipe(res);
@@ -1791,97 +2006,6 @@ async function startServer() {
     }
   );
 
-  /**
-   * Phone Microphone Voice Search Transcription (POST /api/voice-search):
-   * Uses Gemini audio transcription so voice search works reliably across all
-   * mobile browsers, WebViews, and devices using the phone's hardware microphone.
-   */
-  app.post(
-    '/api/voice-search',
-    express.json({ limit: '15mb' }),
-    async (req: Request, res: Response) => {
-      try {
-        const { audioBase64, mimeType } = req.body || {};
-        if (!audioBase64 || typeof audioBase64 !== 'string') {
-          res.status(400).json({ error: 'Missing audioBase64 payload' });
-          return;
-        }
-
-        const apiKey = process.env.GEMINI_API_KEY;
-        if (!apiKey) {
-          res.status(503).json({ error: 'Voice transcription service unavailable' });
-          return;
-        }
-
-        const ai = new GoogleGenAI({
-          apiKey,
-          httpOptions: {
-            headers: {
-              'User-Agent': 'aistudio-build',
-            },
-          },
-        });
-
-        const cleanMime =
-          typeof mimeType === 'string' && mimeType.trim()
-            ? mimeType.split(';')[0].trim()
-            : 'audio/webm';
-
-        const promptText =
-          'Listen to this voice search audio for a live TV streaming app. Transcribe the spoken TV channel name, country, language, or category into English/Latin script (for example, if spoken in Bengali, Hindi, or English, output the standard channel, country, or category name such as "Somoy TV", "Jamuna TV", "Star Jalsha", "BBC News", "Bangladesh", "India", "Sports", "News"). Output ONLY the search query words with no quotes, no punctuation, and no extra explanation. If the audio is only silence or unintelligible background noise, output an empty string.';
-
-        const candidateModels = [
-          'gemini-2.5-flash',
-          'gemini-flash-latest',
-          'gemini-3-flash-preview',
-        ];
-
-        let rawText = '';
-        let lastErr: any = null;
-
-        for (const modelName of candidateModels) {
-          try {
-            const response = await ai.models.generateContent({
-              model: modelName,
-              contents: [
-                {
-                  inlineData: {
-                    mimeType: cleanMime,
-                    data: audioBase64,
-                  },
-                },
-                promptText,
-              ],
-            });
-            rawText = (response.text || '')
-              .replace(/^["'`]+|["'`.,!?]+$/g, '')
-              .trim();
-            lastErr = null;
-            break;
-          } catch (modelErr: any) {
-            lastErr = modelErr;
-          }
-        }
-
-        if (lastErr && !rawText) {
-          res.status(500).json({ error: lastErr?.message || 'Voice transcription failed' });
-          return;
-        }
-
-        // Filter out accidental model meta-responses on silence
-        if (
-          /^(empty string|none|null|silence|no speech|nothing)$/i.test(rawText)
-        ) {
-          rawText = '';
-        }
-
-        res.json({ transcript: rawText });
-      } catch (err: any) {
-        res.status(500).json({ error: err?.message || 'Voice transcription failed' });
-      }
-    }
-  );
-
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -1897,7 +2021,7 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`StreamPulse Server running on http://0.0.0.0:${PORT}`);
+    console.log(`IPTV VIP Server running on http://0.0.0.0:${PORT}`);
     syncOfficialIptvOrgCatalog(true).catch(() => {});
     setInterval(() => {
       syncOfficialIptvOrgCatalog(true).catch(() => {});
