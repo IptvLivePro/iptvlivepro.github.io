@@ -248,10 +248,44 @@ export default function App() {
   const [selectedQuality, setSelectedQuality] = useState<QualityTierId>('auto');
   const [sessionBytes, setSessionBytes] = useState<number>(0);
 
+  // Smart Header state: hides immediately when scrolling down, appears immediately when scrolling up
+  const [isHeaderVisible, setIsHeaderVisible] = useState<boolean>(true);
+  const lastScrollYRef = useRef<number>(0);
+
   useEffect(() => {
-    const handleDocumentPointerDown = (e: PointerEvent) => {
+    const handleScroll = () => {
+      const currentScrollY = window.scrollY || window.pageYOffset || 0;
+      const delta = currentScrollY - lastScrollYRef.current;
+
+      if (currentScrollY <= 16) {
+        setIsHeaderVisible(true);
+      } else if (delta > 1 && currentScrollY > 24) {
+        setIsHeaderVisible(false);
+      } else if (delta < -1) {
+        setIsHeaderVisible(true);
+      }
+
+      lastScrollYRef.current = currentScrollY;
+    };
+
+    window.addEventListener('scroll', handleScroll, { passive: true });
+    return () => window.removeEventListener('scroll', handleScroll);
+  }, []);
+
+  useEffect(() => {
+    const handleOutsideInteraction = (e: Event) => {
       const target = e.target as HTMLElement | null;
       if (!target) return;
+
+      // Blur search input if user clicks/taps anywhere outside the search input box
+      if (
+        searchInputRef.current &&
+        document.activeElement === searchInputRef.current &&
+        !target.closest('[data-search-box]')
+      ) {
+        searchInputRef.current.blur();
+      }
+
       const menuEl = target.closest('[data-card-server-menu]');
       setOpenServerMenuChannelId((prev) => {
         if (!prev) return null;
@@ -260,9 +294,18 @@ export default function App() {
         return clickedId === prev ? prev : null;
       });
     };
-    document.addEventListener('pointerdown', handleDocumentPointerDown, true);
-    return () =>
-      document.removeEventListener('pointerdown', handleDocumentPointerDown, true);
+
+    document.addEventListener('pointerdown', handleOutsideInteraction, true);
+    document.addEventListener('mousedown', handleOutsideInteraction, true);
+    document.addEventListener('touchstart', handleOutsideInteraction, {
+      capture: true,
+      passive: true,
+    });
+    return () => {
+      document.removeEventListener('pointerdown', handleOutsideInteraction, true);
+      document.removeEventListener('mousedown', handleOutsideInteraction, true);
+      document.removeEventListener('touchstart', handleOutsideInteraction, true);
+    };
   }, []);
 
   useEffect(() => {
@@ -547,6 +590,15 @@ export default function App() {
       return;
     }
 
+    // If this exact channel and stream index is already playing, do nothing
+    if (
+      activeChannel &&
+      activeChannel.id.toLowerCase() === ch.id.toLowerCase() &&
+      activeStreamIndex === streamIdx
+    ) {
+      return;
+    }
+
     setUnavailableNoticeChannel(null);
     setCardSelectedServer((prev) => ({ ...prev, [ch.id]: streamIdx }));
     setActiveChannel(ch);
@@ -626,7 +678,9 @@ export default function App() {
   };
 
   const showSearchLoading =
-    isSearching && !isDirectStreamUrlInput(searchQuery);
+    isSearching &&
+    searchQuery.trim().length > 0 &&
+    !isDirectStreamUrlInput(searchQuery);
 
   // Pin currently playing channel card to the very top (index 0) of the channel cards list
   const displayedChannels = React.useMemo(() => {
@@ -646,9 +700,13 @@ export default function App() {
   }, [channels, activeChannel, catalogFilter]);
 
   return (
-    <div className="min-h-screen flex flex-col bg-[#F4F6F9] text-slate-900">
-      {/* TOP HEADER WITH FIXED-WIDTH RED SEARCH BOX (z-50 ensures player top bar never overlays header on scroll) */}
-      <header className="sticky top-0 z-50 h-14 flex items-center justify-between gap-2 sm:gap-6 px-3 sm:px-6 bg-white border-b border-slate-200">
+    <div className="min-h-screen flex flex-col bg-[#F4F6F9] text-slate-900 select-none">
+      {/* SMART TOP HEADER: Hides fast on scroll down, reappears fast on scroll up */}
+      <header
+        className={`sticky top-0 z-50 h-14 flex items-center justify-between gap-2 sm:gap-6 px-3 sm:px-6 bg-white border-b border-slate-200 transition-transform duration-150 ease-out will-change-transform ${
+          isHeaderVisible ? 'translate-y-0' : '-translate-y-full'
+        }`}
+      >
         <a
           href="#top"
           onClick={(e) => {
@@ -658,13 +716,21 @@ export default function App() {
             setIsSearching(false);
             window.scrollTo({ top: 0, behavior: 'smooth' });
           }}
-          className="font-display text-lg sm:text-xl font-bold tracking-tight text-red-600 whitespace-nowrap shrink-0"
+          className="flex items-center gap-2 font-display text-lg sm:text-xl font-bold tracking-tight text-red-600 whitespace-nowrap shrink-0"
         >
-          IPTV VIP
+          <img
+            src="/logo.png"
+            alt="IPTV Live Logo"
+            referrerPolicy="no-referrer"
+            draggable={false}
+            className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg object-contain shrink-0 select-none"
+          />
+          <span>IPTV Live</span>
         </a>
 
-        {/* HEADER SEARCH BOX (CONSTANT FIXED WIDTH, LEFT TV ICON & SINGLE STATEFUL RIGHT ICON, SHOWS FULL 'Search channels...') */}
+        {/* HEADER SEARCH BOX (CONSTANT FIXED WIDTH, LEFT SEARCH ICON, SOFT PLACEHOLDER OPACITY, RIGHT STATEFUL 'GO' -> LOADING -> CROSS) */}
         <form
+          data-search-box="true"
           onClick={() => {
             if (catalogFilter !== 'all') {
               setCatalogFilter('all');
@@ -673,6 +739,11 @@ export default function App() {
           onSubmit={(e) => {
             e.preventDefault();
             const q = searchQuery.trim();
+            if (!q) {
+              searchInputRef.current?.blur();
+              return;
+            }
+            searchInputRef.current?.blur();
             if (isDirectStreamUrlInput(q)) {
               playDirectStreamUrl(q);
               return;
@@ -685,7 +756,7 @@ export default function App() {
           }}
           className="inline-flex items-center w-[172px] sm:w-[190px] bg-red-600 border border-red-700 focus-within:border-red-800 focus-within:ring-2 focus-within:ring-red-500/30 rounded-full pl-2.5 pr-1 py-1 transition-colors shrink-0 overflow-hidden"
         >
-          <Tv className="w-3.5 h-3.5 text-white/95 shrink-0 mr-1.5 pointer-events-none" />
+          <Search className="w-3.5 h-3.5 text-white/95 shrink-0 mr-1.5 pointer-events-none" />
           <input
             ref={searchInputRef}
             type="text"
@@ -700,11 +771,16 @@ export default function App() {
                 setCatalogFilter('all');
               }
             }}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') {
+                searchInputRef.current?.blur();
+              }
+            }}
             onChange={(e) => {
               const nextVal = e.target.value;
               setSearchQuery(nextVal);
               const trimmed = nextVal.trim();
-              if (isDirectStreamUrlInput(trimmed)) {
+              if (!trimmed || isDirectStreamUrlInput(trimmed)) {
                 setIsSearching(false);
                 return;
               }
@@ -715,37 +791,34 @@ export default function App() {
             }}
             placeholder="Search channels..."
             aria-label="Search Channels or Paste Stream URL"
-            className="flex-1 min-w-0 w-full p-0 m-0 bg-transparent border-none text-xs font-medium text-white placeholder-white/95 focus:outline-none leading-tight"
+            className="flex-1 min-w-0 w-full p-0 m-0 bg-transparent border-none text-xs font-medium text-white placeholder-white/60 focus:outline-none leading-tight"
           />
 
-          {/* Single Right-Side Icon Slot: Search Icon (idle) -> Loading Spinner (loading) -> Cross Icon (when query/result present) */}
-          <div className="flex items-center shrink-0 ml-0.5">
+          {/* Single Right-Side Slot: 'GO' (idle) -> Loading Spinner (loading) -> Cross Icon (when query/result present) */}
+          <div className="w-7 h-6 flex items-center justify-center shrink-0 ml-0.5">
             {showSearchLoading ? (
               <div
                 title="Searching..."
                 aria-label="Searching..."
-                className="p-1 flex items-center justify-center pointer-events-none"
+                className="flex items-center justify-center pointer-events-none"
               >
                 <Loader2 className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-white animate-spin" />
               </div>
-            ) : searchQuery.length > 0 ? (
+            ) : searchQuery.trim().length > 0 ? (
               <button
                 type="button"
                 onClick={(e) => {
                   e.stopPropagation();
-                  const wasDirectUrl = isDirectStreamUrlInput(searchQuery);
                   setSearchQuery('');
+                  setIsSearching(false);
                   if (catalogFilter !== 'all') {
                     setCatalogFilter('all');
                   }
-                  if (!wasDirectUrl) {
-                    setIsSearching(true);
-                  }
-                  searchInputRef.current?.focus();
+                  searchInputRef.current?.blur();
                 }}
                 title="Clear search"
                 aria-label="Clear search"
-                className="p-1 rounded-full text-white hover:bg-red-700 transition-colors flex items-center justify-center"
+                className="w-full h-full rounded-full text-white hover:bg-red-700 transition-colors flex items-center justify-center"
               >
                 <X className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
               </button>
@@ -754,9 +827,9 @@ export default function App() {
                 type="submit"
                 title="Search channels"
                 aria-label="Search channels"
-                className="p-1 rounded-full text-white hover:bg-red-700 transition-all flex items-center justify-center"
+                className="w-full h-full rounded-full text-white hover:bg-red-700 transition-all flex items-center justify-center font-display text-[11px] font-extrabold tracking-wide leading-none"
               >
-                <Search className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+                GO
               </button>
             )}
           </div>
@@ -1105,10 +1178,13 @@ export default function App() {
                                     <button
                                       type="button"
                                       onClick={() => {
+                                        if (isSelected && activeStreamIndex === sIdx) {
+                                          return;
+                                        }
                                         setOpenServerMenuChannelId(null);
                                         handleSelectChannel(ch, sIdx);
                                       }}
-                                      className="flex-1 min-w-0 flex items-start gap-1.5 text-left"
+                                      className="flex-1 min-w-0 flex items-start gap-1.5 text-left select-none"
                                     >
                                       {isCurrent ? (
                                         <Check className="w-3.5 h-3.5 shrink-0 mt-0.5 text-white" />
@@ -1116,7 +1192,7 @@ export default function App() {
                                         <Play className="w-3 h-3 shrink-0 mt-0.5 text-red-600 fill-current" />
                                       )}
                                       <span
-                                        className={`font-mono text-[11px] leading-snug break-all select-all ${
+                                        className={`font-mono text-[11px] leading-snug break-all select-none ${
                                           isCurrent
                                             ? 'text-white font-semibold'
                                             : 'text-slate-800 font-medium'
@@ -1178,6 +1254,74 @@ export default function App() {
           )}
         </section>
       </div>
+
+      {/* SITE FOOTER BELOW LOAD MORE CHANNELS WITH INLINE TEXT CREDITS & GITHUB LINKS */}
+      <footer className="mt-auto bg-white border-t border-slate-200 text-slate-600">
+        <div className="max-w-6xl mx-auto px-3 sm:px-6 py-6 flex flex-col gap-3">
+          {/* Brand & Description */}
+          <div className="flex items-center gap-2.5">
+            <img
+              src="/logo.png"
+              alt="IPTV Live Logo"
+              referrerPolicy="no-referrer"
+              draggable={false}
+              className="w-8 h-8 rounded-lg object-contain shrink-0 select-none"
+            />
+            <div>
+              <span className="font-display text-base font-bold text-red-600 leading-none">
+                IPTV Live
+              </span>
+              <p className="text-[11px] sm:text-xs text-slate-500 mt-0.5">
+                IPTV LIVE is a free online IPTV player to stream live TV channels using M3U and M3U8 playlists.
+              </p>
+            </div>
+          </div>
+
+          <div className="pt-3 border-t border-slate-100 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 text-[11px] leading-relaxed text-slate-500">
+            <p className="text-[11px]">
+              Credits: Live TV channel directory, metadata &amp; M3U8 streams powered by{' '}
+              <a
+                href="https://iptv-org.github.io/"
+                target="_blank"
+                rel="noopener noreferrer"
+                title="https://iptv-org.github.io/"
+                className="inline-flex items-center gap-1 text-[11px] font-semibold text-slate-700 hover:text-red-600 underline underline-offset-2 align-baseline"
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="currentColor"
+                  className="w-3 h-3 shrink-0 inline-block"
+                  aria-hidden="true"
+                >
+                  <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z" />
+                </svg>
+                <span>iptv-org</span>
+              </a>{' '}
+              • Built with HLS.js, MPEGTS.js &amp; FFmpeg Transcoder.
+            </p>
+            <p className="shrink-0 text-[11px]">
+              Developed by{' '}
+              <a
+                href="https://github.com/MRLIKHANROY"
+                target="_blank"
+                rel="noopener noreferrer"
+                title="https://github.com/MRLIKHANROY"
+                className="inline-flex items-center gap-1 text-[11px] font-bold text-red-600 hover:underline align-baseline"
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="currentColor"
+                  className="w-3 h-3 shrink-0 inline-block"
+                  aria-hidden="true"
+                >
+                  <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z" />
+                </svg>
+                <span>MRLIKHANROY</span>
+              </a>
+            </p>
+          </div>
+        </div>
+      </footer>
     </div>
   );
 }

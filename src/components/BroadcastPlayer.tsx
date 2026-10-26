@@ -2077,13 +2077,14 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
                           type="button"
                           onClick={(e) => {
                             e.stopPropagation();
+                            if (isCurrent) return;
                             onSelectStreamIndex(sIdx);
                             setShowServerMenu(false);
                             resetFullscreenAutoHideTimer();
                           }}
-                          className="flex-1 min-w-0 h-full flex items-center text-left"
+                          className="flex-1 min-w-0 h-full flex items-center text-left select-none"
                         >
-                          <span className="font-mono text-[10px] whitespace-nowrap overflow-x-auto no-scrollbar select-all">
+                          <span className="font-mono text-[10px] whitespace-nowrap overflow-x-auto no-scrollbar select-none">
                             {st.url}
                           </span>
                         </button>

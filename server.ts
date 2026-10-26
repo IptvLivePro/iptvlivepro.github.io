@@ -2006,6 +2006,27 @@ async function startServer() {
     }
   );
 
+  // Serve root logo.png and favicon.png directly from the workspace root directory
+  app.get('/logo.png', (_req: Request, res: Response) => {
+    const rootLogoPath = path.resolve(process.cwd(), 'logo.png');
+    if (fs.existsSync(rootLogoPath)) {
+      res.setHeader('Content-Type', 'image/png');
+      res.sendFile(rootLogoPath);
+      return;
+    }
+    res.status(404).end();
+  });
+
+  app.get(['/favicon.png', '/favicon.ico'], (_req: Request, res: Response) => {
+    const rootFaviconPath = path.resolve(process.cwd(), 'favicon.png');
+    if (fs.existsSync(rootFaviconPath)) {
+      res.setHeader('Content-Type', 'image/png');
+      res.sendFile(rootFaviconPath);
+      return;
+    }
+    res.status(404).end();
+  });
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -2021,7 +2042,7 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`IPTV VIP Server running on http://0.0.0.0:${PORT}`);
+    console.log(`IPTV LIVE – Online IPTV Player for Live TV Streaming running on http://0.0.0.0:${PORT}`);
     syncOfficialIptvOrgCatalog(true).catch(() => {});
     setInterval(() => {
       syncOfficialIptvOrgCatalog(true).catch(() => {});

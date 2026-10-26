@@ -1,6 +1,6 @@
 {
-  "name": "IPTV VIP — Universal Live TV & Data-Saver Studio",
-  "description": "Modern universal HTTP/HTTPS IPTV broadcast player with true 1080p–144p bandwidth control, live DVR recording, and M3U playlist management.",
+  "name": "IPTV LIVE – Online IPTV Player for Live TV Streaming",
+  "description": "IPTV LIVE is a free online IPTV player to stream live TV channels using M3U and M3U8 playlists. Enjoy easy playback on mobile, tablet, and desktop.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
