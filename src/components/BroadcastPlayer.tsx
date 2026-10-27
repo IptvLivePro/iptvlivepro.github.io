@@ -211,8 +211,51 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
     computeInitialEngine(activeStreamUrl)
   );
   const [isPlaying, setIsPlaying] = useState<boolean>(true);
-  const [isMuted, setIsMuted] = useState<boolean>(false);
-  const [volume, setVolume] = useState<number>(0.9);
+  const [isMuted, setIsMuted] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('iptv_player_muted') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const [volume, setVolume] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('iptv_player_volume');
+      if (saved !== null) {
+        const parsed = parseFloat(saved);
+        if (!isNaN(parsed) && parsed >= 0 && parsed <= 1) {
+          return parsed;
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return 0.9;
+  });
+  const volumeRef = useRef<number>(volume);
+  const isMutedRef = useRef<boolean>(isMuted);
+
+  const syncMediaVolume = useCallback(() => {
+    const clampedVol = Math.max(0, Math.min(1, volumeRef.current));
+    const muted = isMutedRef.current;
+    if (videoRef.current) {
+      if (Math.abs(videoRef.current.volume - clampedVol) > 0.005) {
+        videoRef.current.volume = clampedVol;
+      }
+      if (videoRef.current.muted !== muted) {
+        videoRef.current.muted = muted;
+      }
+    }
+    if (mpegtsRef.current) {
+      try {
+        mpegtsRef.current.volume = muted ? 0 : clampedVol;
+        mpegtsRef.current.muted = muted;
+      } catch {
+        // ignore
+      }
+    }
+  }, []);
+
   const [isBuffering, setIsBuffering] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [logoCandidateIdx, setLogoCandidateIdx] = useState<number>(0);
@@ -275,8 +318,29 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
   const [showQualityMenu, setShowQualityMenu] = useState<boolean>(false);
   const [showServerMenu, setShowServerMenu] = useState<boolean>(false);
   const [showRecordMenu, setShowRecordMenu] = useState<boolean>(false);
+  const [showRecordConfirmMenu, setShowRecordConfirmMenu] = useState<boolean>(false);
 
-  // Close player menus (Server Selection, Quality Selection, Recording Quality Selection) when clicking anywhere outside
+  const bottomTrayRef = useRef<HTMLDivElement>(null);
+  const recordBtnGroupRef = useRef<HTMLDivElement>(null);
+  const [recordPopoverRightPx, setRecordPopoverRightPx] = useState<number>(136);
+
+  const updateRecordPopoverPosition = useCallback(() => {
+    const trayEl = bottomTrayRef.current;
+    const recEl = recordBtnGroupRef.current;
+    if (!trayEl || !recEl) return;
+    const trayRect = trayEl.getBoundingClientRect();
+    const recRect = recEl.getBoundingClientRect();
+    if (trayRect.width <= 0 || recRect.width <= 0) return;
+
+    const popoverWidth = 176; // w-44 = 176px
+    const recCenterFromRight = trayRect.right - (recRect.left + recRect.width / 2);
+    const idealRight = Math.round(recCenterFromRight - popoverWidth / 2);
+    const minRight = 8;
+    const maxRight = Math.max(8, Math.floor(trayRect.width - popoverWidth - 8));
+    setRecordPopoverRightPx(Math.max(minRight, Math.min(maxRight, idealRight)));
+  }, []);
+
+  // Close player menus (Server Selection, Quality Selection, Recording Quality & Start/Cancel Selection) when clicking anywhere outside
   useEffect(() => {
     const handleDocumentPointerDown = (e: PointerEvent) => {
       const target = e.target as HTMLElement | null;
@@ -289,6 +353,9 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
       }
       if (!target.closest('[data-player-menu="record"]')) {
         setShowRecordMenu(false);
+      }
+      if (!target.closest('[data-player-menu="record-confirm"]')) {
+        setShowRecordConfirmMenu(false);
       }
     };
     document.addEventListener('pointerdown', handleDocumentPointerDown, true);
@@ -407,18 +474,46 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
     }, 900);
   }, []);
 
+  useEffect(() => {
+    if (showRecordConfirmMenu || showRecordMenu || pendingRecording) {
+      updateRecordPopoverPosition();
+    }
+  }, [
+    showRecordConfirmMenu,
+    showRecordMenu,
+    pendingRecording,
+    viewportSize,
+    isFullscreen,
+    isRotatedHorizontal,
+    updateRecordPopoverPosition,
+  ]);
+
   // 3-second auto-hide timer when zoomed into Fullscreen
   const resetFullscreenAutoHideTimer = useCallback(() => {
     if (hideControlsTimerRef.current) {
       clearTimeout(hideControlsTimerRef.current);
       hideControlsTimerRef.current = null;
     }
-    if (isFullscreen && !showQualityMenu && !showRecordMenu && !showServerMenu && !pendingRecording) {
+    if (
+      isFullscreen &&
+      !showQualityMenu &&
+      !showRecordMenu &&
+      !showRecordConfirmMenu &&
+      !showServerMenu &&
+      !pendingRecording
+    ) {
       hideControlsTimerRef.current = window.setTimeout(() => {
         setShowControls(false);
       }, 3000);
     }
-  }, [isFullscreen, showQualityMenu, showRecordMenu, showServerMenu, pendingRecording]);
+  }, [
+    isFullscreen,
+    showQualityMenu,
+    showRecordMenu,
+    showRecordConfirmMenu,
+    showServerMenu,
+    pendingRecording,
+  ]);
 
   useEffect(() => {
     if (isFullscreen) {
@@ -732,6 +827,7 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
       currentChannel.streams[0];
 
     destroyPlayers();
+    syncMediaVolume();
 
     if (!video || !currentStream?.url) {
       setIsConnectingWindow(false);
@@ -888,6 +984,7 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
       video.src = videoSrc;
       video.crossOrigin = 'anonymous';
       video.load();
+      syncMediaVolume();
       const playPromise = video.play();
       if (playPromise) {
         playPromise
@@ -963,6 +1060,7 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
         mpegtsRef.current = player;
         player.attachMediaElement(video);
         player.load();
+        syncMediaVolume();
         const playPromise = player.play();
         if (playPromise && typeof playPromise.then === 'function') {
           playPromise
@@ -1031,6 +1129,7 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
 
       video.src = transcodeUrl;
       video.load();
+      syncMediaVolume();
       video
         .play()
         .then(() => {
@@ -1113,6 +1212,7 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
       hlsRef.current = hls;
       hls.loadSource(targetHlsUrl);
       hls.attachMedia(video);
+      syncMediaVolume();
 
       // Fast startup watchdog (4.5s for proxy-hls, 3.8s for direct-hls) so FFmpeg/VLC engine is always reached within 20s!
       const hlsWatchdogMs = playbackEngine === 'proxy-hls' ? 4500 : 3800;
@@ -1360,6 +1460,7 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
       };
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
       video.src = targetHlsUrl;
+      syncMediaVolume();
       video
         .play()
         .then(() => {
@@ -1400,6 +1501,7 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
     applyQualityToHls,
     clearServer15sTimer,
     markServerPlaybackSucceeded,
+    syncMediaVolume,
   ]);
 
   /**
@@ -1514,6 +1616,7 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
     };
 
     const onPlaying = () => {
+      syncMediaVolume();
       if (video.readyState >= 2) {
         markServerPlaybackSucceeded();
         clearBufferingNow();
@@ -1526,6 +1629,7 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
     };
 
     const onCanPlay = () => {
+      syncMediaVolume();
       if (video.readyState >= 2) {
         markServerPlaybackSucceeded();
         clearBufferingNow();
@@ -1533,6 +1637,15 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
       if (video.videoHeight > 0) {
         setDetectedHeight(video.videoHeight);
       }
+    };
+
+    const onLoadedMetadataOrStart = () => {
+      syncMediaVolume();
+    };
+
+    const onVolumeChange = () => {
+      // Prevent any underlying playback engine (e.g. mpegts.js or new MSE attachment) from resetting volume
+      syncMediaVolume();
     };
 
     const onWaiting = () => {
@@ -1562,6 +1675,9 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
       }
     };
 
+    video.addEventListener('loadstart', onLoadedMetadataOrStart);
+    video.addEventListener('loadedmetadata', onLoadedMetadataOrStart);
+    video.addEventListener('volumechange', onVolumeChange);
     video.addEventListener('playing', onPlaying);
     video.addEventListener('canplay', onCanPlay);
     video.addEventListener('canplaythrough', onCanPlay);
@@ -1572,20 +1688,28 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
       if (waitingDebounceTimerRef.current) {
         clearTimeout(waitingDebounceTimerRef.current);
       }
+      video.removeEventListener('loadstart', onLoadedMetadataOrStart);
+      video.removeEventListener('loadedmetadata', onLoadedMetadataOrStart);
+      video.removeEventListener('volumechange', onVolumeChange);
       video.removeEventListener('playing', onPlaying);
       video.removeEventListener('canplay', onCanPlay);
       video.removeEventListener('canplaythrough', onCanPlay);
       video.removeEventListener('waiting', onWaiting);
       video.removeEventListener('timeupdate', onTimeUpdate);
     };
-  }, [markServerPlaybackSucceeded]);
+  }, [markServerPlaybackSucceeded, syncMediaVolume]);
 
   useEffect(() => {
-    if (videoRef.current) {
-      videoRef.current.volume = volume;
-      videoRef.current.muted = isMuted;
+    volumeRef.current = volume;
+    isMutedRef.current = isMuted;
+    syncMediaVolume();
+    try {
+      localStorage.setItem('iptv_player_volume', String(volume));
+      localStorage.setItem('iptv_player_muted', String(isMuted));
+    } catch {
+      // ignore
     }
-  }, [volume, isMuted]);
+  }, [volume, isMuted, syncMediaVolume]);
 
   const togglePlay = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -2037,6 +2161,7 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
                     setShowServerMenu((prev) => !prev);
                     setShowQualityMenu(false);
                     setShowRecordMenu(false);
+                    setShowRecordConfirmMenu(false);
                   }}
                   title="Select Playing Stream Server"
                   className="flex items-center justify-center gap-1 px-2 py-0.5 border-t border-red-400/50 hover:bg-red-700 active:bg-red-800 rounded-b-lg text-[9px] sm:text-[10px] font-bold leading-tight transition-colors whitespace-nowrap cursor-pointer"
@@ -2281,45 +2406,11 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
             </div>
           )}
 
-          {pendingRecording && !isRecording && (
-            <div
-              onClick={(e) => e.stopPropagation()}
-              className="absolute inset-x-3 bottom-14 sm:inset-x-auto sm:left-3 sm:bottom-14 flex flex-wrap items-center justify-between gap-3 px-3.5 py-2.5 rounded-2xl bg-white border-2 border-red-600 text-slate-900 shadow-2xl z-30"
-            >
-              <div className="min-w-0">
-                <p className="text-xs font-bold text-slate-900">
-                  Recording Finished ({formatTime(pendingRecording.durationSec)} ·{' '}
-                  {pendingRecording.quality})
-                </p>
-                <p className="text-[11px] font-mono text-slate-500 truncate max-w-[200px] sm:max-w-xs">
-                  {(pendingRecording.sizeBytes / (1024 * 1024)).toFixed(2)} MB ·{' '}
-                  {pendingRecording.filename}
-                </p>
-              </div>
-              <div className="flex items-center gap-2 shrink-0">
-                <button
-                  type="button"
-                  onClick={handleConfirmDownloadRecording}
-                  className="flex items-center gap-1 px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition-colors whitespace-nowrap shrink-0"
-                >
-                  <Download className="w-3.5 h-3.5" />
-                  <span>Download</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={handleCancelRecording}
-                  className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-slate-100 hover:bg-red-600 text-slate-700 hover:text-white border border-slate-200 text-xs font-bold transition-colors whitespace-nowrap shrink-0"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                  <span>Cancel</span>
-                </button>
-              </div>
-            </div>
-          )}
         </div>
 
         {/* ULTRA-SLEEK COMPACT BOTTOM CONTROL TRAY (z-50 when quality/record menu is open so it always renders above the top bar and never gets clipped) */}
         <div
+          ref={bottomTrayRef}
           onClick={(e) => {
             e.stopPropagation();
             resetFullscreenAutoHideTimer();
@@ -2327,22 +2418,125 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
           className={`w-full flex flex-col px-2.5 sm:px-4 pt-1 pb-1.5 transition-opacity duration-200 ${
             isFullscreen
               ? `absolute bottom-0 inset-x-0 ${
-                  showQualityMenu || showRecordMenu ? 'z-[60]' : 'z-40'
+                  showQualityMenu ||
+                  showRecordMenu ||
+                  showRecordConfirmMenu ||
+                  pendingRecording
+                    ? 'z-[60]'
+                    : 'z-40'
                 } bg-gradient-to-t from-black/95 via-black/80 to-transparent text-white pt-4 ${
                   showControls
                     ? 'opacity-100 pointer-events-auto'
                     : 'opacity-0 pointer-events-none'
                 }`
               : `relative ${
-                  showQualityMenu || showRecordMenu ? 'z-50' : 'z-30'
+                  showQualityMenu ||
+                  showRecordMenu ||
+                  showRecordConfirmMenu ||
+                  pendingRecording
+                    ? 'z-50'
+                    : 'z-30'
                 } bg-white border-t border-slate-200 text-slate-900 rounded-b-2xl opacity-100 pointer-events-auto`
           }`}
         >
+          {/* SCREEN RECORDING START / CANCEL POPOVER (Directly above Screen Recording option, matching Server Selection box layout) */}
+          {showRecordConfirmMenu && !isRecording && (
+            <div
+              data-player-menu="record-confirm"
+              onClick={(e) => e.stopPropagation()}
+              style={{ right: `${recordPopoverRightPx}px` }}
+              className={`absolute bottom-full mb-1.5 w-44 rounded-2xl shadow-xl p-1.5 z-50 flex flex-col gap-1 ${menuSurfaceClass}`}
+            >
+              <button
+                type="button"
+                onClick={(e) => {
+                  setShowRecordConfirmMenu(false);
+                  startRecording(e);
+                }}
+                className="w-full h-7 flex items-center justify-between gap-1 px-2.5 rounded-xl text-xs font-bold bg-red-600 hover:bg-red-700 text-white transition-colors cursor-pointer"
+              >
+                <span className="flex items-center gap-1.5">
+                  <Disc className="w-3.5 h-3.5 shrink-0" />
+                  <span>Start</span>
+                </span>
+                <span className="font-mono tabular-nums text-[10px] opacity-90">
+                  {recordQuality}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setShowRecordConfirmMenu(false);
+                  resetFullscreenAutoHideTimer();
+                }}
+                className={`w-full h-7 flex items-center justify-between gap-1 px-2.5 rounded-xl text-xs font-bold transition-colors cursor-pointer ${
+                  isFullscreen
+                    ? 'text-slate-200 hover:bg-white/10'
+                    : 'text-slate-700 hover:bg-slate-100'
+                }`}
+              >
+                <span className="flex items-center gap-1.5">
+                  <X className="w-3.5 h-3.5 shrink-0" />
+                  <span>Cancel</span>
+                </span>
+                <span className="font-mono text-[10px] opacity-75">Close</span>
+              </button>
+            </div>
+          )}
+
+          {/* RECORDING FINISHED DOWNLOAD / CANCEL POPOVER (Directly above Screen Recording option, matching Server Selection box layout) */}
+          {pendingRecording &&
+            !isRecording &&
+            !showRecordConfirmMenu &&
+            !showRecordMenu && (
+              <div
+                onClick={(e) => e.stopPropagation()}
+                style={{ right: `${recordPopoverRightPx}px` }}
+                className={`absolute bottom-full mb-1.5 w-44 rounded-2xl shadow-xl p-1.5 z-50 flex flex-col gap-1 ${menuSurfaceClass}`}
+              >
+                <button
+                  type="button"
+                  onClick={handleConfirmDownloadRecording}
+                  className="w-full h-7 flex items-center justify-between gap-1 px-2.5 rounded-xl text-xs font-bold bg-red-600 hover:bg-red-700 text-white transition-colors cursor-pointer"
+                >
+                  <span className="flex items-center gap-1.5">
+                    <Download className="w-3.5 h-3.5 shrink-0" />
+                    <span>Download</span>
+                  </span>
+                  <span className="font-mono tabular-nums text-[10px] opacity-90">
+                    {(pendingRecording.sizeBytes / (1024 * 1024)).toFixed(2)} MB
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleCancelRecording}
+                  className={`w-full h-7 flex items-center justify-between gap-1 px-2.5 rounded-xl text-xs font-bold transition-colors cursor-pointer ${
+                    isFullscreen
+                      ? 'text-slate-200 hover:bg-white/10'
+                      : 'text-slate-700 hover:bg-slate-100'
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5">
+                    <Trash2 className="w-3.5 h-3.5 shrink-0" />
+                    <span>Cancel</span>
+                  </span>
+                  <span className="font-mono tabular-nums text-[10px] opacity-75">
+                    {formatTime(pendingRecording.durationSec)}
+                  </span>
+                </button>
+              </div>
+            )}
+
+          {/* RECORDING QUALITY MENU (Directly above Screen Recording option) */}
           {showRecordMenu && !isRecording && (
             <div
               data-player-menu="record"
               onClick={(e) => e.stopPropagation()}
-              className={`absolute bottom-full right-2.5 sm:right-4 mb-1.5 w-44 rounded-2xl shadow-xl p-1.5 z-50 ${menuSurfaceClass}`}
+              style={{ right: `${recordPopoverRightPx}px` }}
+              className={`absolute bottom-full mb-1.5 w-44 rounded-2xl shadow-xl p-1.5 z-50 ${menuSurfaceClass}`}
             >
               {(['1080p', '720p', '480p', '360p', '240p', '144p'] as QualityTierId[]).map(
                 (qId) => {
@@ -2567,13 +2761,25 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
             </div>
 
             <div className="flex flex-nowrap items-center gap-1 sm:gap-1.5 shrink-0">
-              <div className={`flex items-center rounded-lg shrink-0 ${buttonSurfaceClass}`}>
+              <div
+                ref={recordBtnGroupRef}
+                className={`flex items-center rounded-lg shrink-0 ${buttonSurfaceClass}`}
+              >
                 {!isRecording ? (
                   <>
                     <button
                       type="button"
-                      onClick={startRecording}
-                      className="flex items-center gap-1 pl-2 pr-1.5 py-1 text-[11px] sm:text-xs font-bold transition-colors whitespace-nowrap shrink-0"
+                      data-player-menu="record-confirm"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        updateRecordPopoverPosition();
+                        setShowRecordConfirmMenu((prev) => !prev);
+                        setShowRecordMenu(false);
+                        setShowQualityMenu(false);
+                        setShowServerMenu(false);
+                        resetFullscreenAutoHideTimer();
+                      }}
+                      className="flex items-center gap-1 pl-2 pr-1.5 py-1 text-[11px] sm:text-xs font-bold transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                     >
                       <Disc className="w-3 h-3 text-red-600" />
                       <span>Rec ({recordQuality})</span>
@@ -2583,12 +2789,14 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
                       data-player-menu="record"
                       onClick={(e) => {
                         e.stopPropagation();
+                        updateRecordPopoverPosition();
                         setShowRecordMenu((prev) => !prev);
+                        setShowRecordConfirmMenu(false);
                         setShowQualityMenu(false);
                         setShowServerMenu(false);
                       }}
                       title="Recording Quality"
-                      className={`pr-1.5 pl-1 py-1 border-l ${
+                      className={`pr-1.5 pl-1 py-1 border-l cursor-pointer ${
                         isFullscreen ? 'border-white/15' : 'border-slate-200'
                       }`}
                     >
@@ -2599,7 +2807,7 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
                   <button
                     type="button"
                     onClick={stopRecording}
-                    className="flex items-center gap-1 px-2.5 py-1 text-[11px] sm:text-xs font-bold bg-red-600 hover:bg-red-700 text-white rounded-lg transition-colors whitespace-nowrap shrink-0"
+                    className="flex items-center gap-1 px-2.5 py-1 text-[11px] sm:text-xs font-bold bg-red-600 hover:bg-red-700 text-white rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                   >
                     <Square className="w-2.5 h-2.5 fill-current" />
                     <span className="font-mono tabular-nums">
@@ -2617,6 +2825,7 @@ export const BroadcastPlayer: React.FC<BroadcastPlayerProps> = ({
                   setShowQualityMenu((prev) => !prev);
                   setShowServerMenu(false);
                   setShowRecordMenu(false);
+                  setShowRecordConfirmMenu(false);
                 }}
                 title="Video Quality"
                 className={`flex items-center justify-center gap-1 px-2 py-1 text-[11px] sm:text-xs font-bold rounded-lg transition-colors whitespace-nowrap shrink-0 ${buttonSurfaceClass}`}
