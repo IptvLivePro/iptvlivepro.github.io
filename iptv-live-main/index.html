@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>IPTV LIVE – Online IPTV Player for Live TV Streaming</title>
+    <meta name="description" content="IPTV LIVE is a free online IPTV player to stream live TV channels using M3U and M3U8 playlists. Enjoy easy playback on mobile, tablet, and desktop." />
+    <meta name="robots" content="index, follow" />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <link rel="shortcut icon" type="image/png" href="/favicon.png" />
+    <link rel="apple-touch-icon" href="/favicon.png" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="IPTV LIVE – Online IPTV Player for Live TV Streaming" />
+    <meta property="og:description" content="IPTV LIVE is a free online IPTV player to stream live TV channels using M3U and M3U8 playlists. Enjoy easy playback on mobile, tablet, and desktop." />
+    <meta property="og:site_name" content="IPTV LIVE – Online IPTV Player for Live TV Streaming" />
+    <meta property="og:image" content="/logo.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="IPTV LIVE – Online IPTV Player for Live TV Streaming" />
+    <meta name="twitter:description" content="IPTV LIVE is a free online IPTV player to stream live TV channels using M3U and M3U8 playlists. Enjoy easy playback on mobile, tablet, and desktop." />
+    <meta name="twitter:image" content="/logo.png" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "WebApplication",
+        "name": "IPTV LIVE – Online IPTV Player for Live TV Streaming",
+        "alternateName": "IPTV Live",
+        "applicationCategory": "MultimediaApplication",
+        "operatingSystem": "All",
+        "description": "IPTV LIVE is a free online IPTV player to stream live TV channels using M3U and M3U8 playlists. Enjoy easy playback on mobile, tablet, and desktop.",
+        "image": "/logo.png",
+        "offers": {
+          "@type": "Offer",
+          "price": "0",
+          "priceCurrency": "USD"
+        }
+      }
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  </head>
+  <body class="bg-[#F4F6F9] text-slate-900 antialiased select-none overflow-x-hidden">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+    <script>
+      (function () {
+        window.addEventListener('DOMContentLoaded', function () {
+          setTimeout(function () {
+            var root = document.getElementById('root');
+            if (root && root.childNodes.length === 0) {
+              var css = document.createElement('link');
+              css.rel = 'stylesheet';
+              css.href = './public/app-bundle.css';
+              document.head.appendChild(css);
+
+              var s = document.createElement('script');
+              s.type = 'module';
+              s.src = './public/app-bundle.js';
+              document.body.appendChild(s);
+            }
+          }, 350);
+        });
+      })();
+    </script>
+  </body>
+</html>

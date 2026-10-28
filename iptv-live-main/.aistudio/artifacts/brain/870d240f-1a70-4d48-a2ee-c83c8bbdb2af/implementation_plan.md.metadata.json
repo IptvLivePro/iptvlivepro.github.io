@@ -1,0 +1,6 @@
+{
+  "summary":  "Updated implementation plan to completely remove the Play Stream URL button and modal, place the Favorites button at the top-right corner of channel cards, purge all stale caches and dead-stream filters, and cleanly load all channels, logos, and stream URLs from https://iptv-org.github.io/iptv/index.m3u and https://iptv-org.github.io/.",
+  "updatedAt":  "2026-10-24T07:20:47.269095173Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}
